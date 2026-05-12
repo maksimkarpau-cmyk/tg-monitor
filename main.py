@@ -14,6 +14,11 @@ TG Parser v3 — два аккаунта, скоринг + модерация ч
   3. Скоринг      → авто-отправка или карточка на модерацию
 
 Модерацию (polling getUpdates) обрабатывает GAS-триггер.
+
+Кэш резолва:
+  - При старте читается из листа «Кэш» → entity_id не запрашиваются повторно
+  - Каждый новый резолв дописывается в лист «Кэш»
+  - Лист «Кэш»: колонки A=username, B=entity_id, C=chat_name
 """
 
 import asyncio
@@ -74,7 +79,7 @@ state = {
     'minus_words':       [],   # [str]
     'watched_ids':       set(),
     'id_to_meta':        {},   # {abs_id: {chat_name, username}}
-    'username_to_meta':  {},   # кэш резолва
+    'username_to_meta':  {},   # кэш резолва (in-memory)
 }
 
 # Дедупликация: храним последние 2000 (chat_id, msg_id) чтобы не писать дубли
@@ -82,6 +87,9 @@ state = {
 seen_ids: deque = deque(maxlen=2000)
 
 _executor = ThreadPoolExecutor(max_workers=4)
+
+# Зарегистрированные хендлеры NewMessage (для перерегистрации при обновлении списка каналов)
+_registered_handlers: dict = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -143,7 +151,7 @@ def _read_scoring_rules(ss):
 
 def _read_minus_words(ss):
     try:
-        data  = ss.worksheet('Минус-слова').get_all_values()
+        data = ss.worksheet('Минус-слова').get_all_values()
         return [str(row[0]).strip().lower() for row in data[1:] if row and row[0].strip()]
     except Exception as e:
         log.error('Ошибка чтения минус-слов: ' + str(e))
@@ -152,9 +160,7 @@ def _read_minus_words(ss):
 
 def _read_channels(ss):
     """
-    Колонка D (Аккаунт) теперь игнорируется для распределения —
-    оба аккаунта слушают все каналы. Колонка остаётся в таблице
-    для информации (куда пришёл пост фактически).
+    Колонка D (Аккаунт) игнорируется — оба аккаунта слушают все каналы.
     """
     try:
         data   = ss.worksheet('Каналы').get_all_values()
@@ -172,6 +178,36 @@ def _read_channels(ss):
     except Exception as e:
         log.error('Ошибка чтения каналов: ' + str(e))
         return []
+
+
+def _read_cache(ss) -> dict:
+    """
+    Читает кэш резолва из листа «Кэш».
+    Формат: A=username, B=entity_id, C=chat_name
+    Возвращает {username: {entity_id, chat_name, username}}
+    """
+    try:
+        data   = ss.worksheet('Кэш').get_all_values()
+        result = {}
+        for row in data[1:]:
+            if not row or not row[0].strip():
+                continue
+            try:
+                username  = row[0].strip()
+                entity_id = int(row[1].strip())
+                chat_name = row[2].strip() if len(row) > 2 else username
+                result[username] = {
+                    'entity_id': entity_id,
+                    'chat_name': chat_name,
+                    'username':  username,
+                }
+            except (ValueError, IndexError):
+                continue
+        log.info(f'Кэш загружен из таблицы: {len(result)} каналов')
+        return result
+    except Exception as e:
+        log.error(f'Ошибка чтения кэша: {e}')
+        return {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -221,6 +257,34 @@ def _write_log(ss, level, message, account=''):
         )
     except Exception as e:
         log.error('Ошибка записи лога: ' + str(e))
+
+
+def _write_cache_row(ss, username: str, entity_id: int, chat_name: str):
+    """Дописывает одну строку в лист «Кэш»."""
+    try:
+        ss.worksheet('Кэш').append_row(
+            [username, str(entity_id), chat_name],
+            value_input_option='USER_ENTERED',
+        )
+    except Exception as e:
+        log.error(f'Ошибка записи кэша для {username}: {e}')
+
+
+def _rebuild_cache(ss, entries: list):
+    """
+    Полностью перезаписывает лист «Кэш» за один запрос.
+    entries = list of {'username', 'entity_id', 'chat_name'}
+    Вызывается после массового резолва при старте.
+    """
+    try:
+        ws   = ss.worksheet('Кэш')
+        rows = [['username', 'entity_id', 'chat_name']]
+        rows += [[e['username'], str(e['entity_id']), e['chat_name']] for e in entries]
+        ws.clear()
+        ws.update('A1', rows, value_input_option='USER_ENTERED')
+        log.info(f'Кэш перезаписан: {len(entries)} записей')
+    except Exception as e:
+        log.error(f'Ошибка перезаписи кэша: {e}')
 
 
 def _set_channel_status(ss, username: str, status: str):
@@ -370,139 +434,21 @@ def _forward_message_sync(token: str, from_chat_id, message_id_tg: int, dest_cha
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Управление подпиской на каналы (dual-account с fallback)
+# Обработчик новых сообщений
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _resolve_entity(clients: dict, username: str, ss) -> dict | None:
+def _register_handler(client: TelegramClient, acc_label: str, ss, chat_ids: list):
     """
-    Пробует резолвить канал через acc1, при ошибке — через acc2.
-    Если оба провалились — шлёт алерт и ставит статус «недоступен».
-    Возвращает meta-dict или None.
+    Регистрирует (или перерегистрирует) NewMessage-хендлер с явным списком
+    chat_ids. Без chats= Telethon не гарантирует доставку событий для
+    супергрупп/каналов при большом их количестве.
     """
-    errors = {}
-    for acc_name, client in clients.items():
-        try:
-            entity    = await client.get_entity(username)
-            eid       = abs(entity.id)
-            chat_name = getattr(entity, 'title', None) or username
-            log.info(f'Резолв [{acc_name}]: {username} → {eid} ({chat_name})')
-            return {
-                'entity_id': eid,
-                'chat_name': chat_name,
-                'username':  username,
-            }
-        except FloodWaitError as e:
-            log.warning(f'[{acc_name}] FloodWait при резолве {username}: жду {e.seconds}s')
-            await asyncio.sleep(e.seconds + 2)
-            # повторяем тот же аккаунт один раз
-            try:
-                entity    = await client.get_entity(username)
-                eid       = abs(entity.id)
-                chat_name = getattr(entity, 'title', None) or username
-                return {'entity_id': eid, 'chat_name': chat_name, 'username': username}
-            except Exception as e2:
-                errors[acc_name] = str(e2)
-        except (ChannelPrivateError, UsernameNotOccupiedError, UsernameInvalidError) as e:
-            errors[acc_name] = str(e)
-            log.warning(f'[{acc_name}] Недоступен {username}: {e}')
-        except Exception as e:
-            errors[acc_name] = str(e)
-            log.error(f'[{acc_name}] Ошибка резолва {username}: {e}')
+    # Удаляем старый хендлер если есть
+    if acc_label in _registered_handlers:
+        client.remove_event_handler(_registered_handlers[acc_label])
+        log.info(f'[{acc_label}] Старый хендлер удалён')
 
-        await asyncio.sleep(0.5)
-
-    # Оба провалились
-    msg = f'🚫 Канал недоступен обоим аккаунтам: @{username}\nacc1: {errors.get("acc1","—")}\nacc2: {errors.get("acc2","—")}'
-    log.error(msg)
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(
-        _executor, _send_alert,
-        state['tg_token'], state['moderator_chat_id'], msg
-    )
-    await loop.run_in_executor(_executor, _set_channel_status, ss, username, 'недоступен')
-    await loop.run_in_executor(_executor, _write_log, ss, 'ERROR', msg)
-    return None
-
-
-async def _update_watched_chats(clients: dict, channels: list, ss):
-    new_ids     = set()
-    new_id_meta = {}
-
-    for ch in channels:
-        username = ch['username']
-
-        cached = state['username_to_meta'].get(username)
-        if cached and 'entity_id' in cached:
-            eid = cached['entity_id']
-            new_ids.add(eid)
-            new_id_meta[eid] = cached
-            continue
-
-        meta = await _resolve_entity(clients, username, ss)
-        if meta:
-            eid = meta['entity_id']
-            new_ids.add(eid)
-            new_id_meta[eid]                   = meta
-            state['username_to_meta'][username] = meta
-            await asyncio.sleep(0.8)
-
-    added   = new_ids - state['watched_ids']
-    removed = state['watched_ids'] - new_ids
-
-    state['watched_ids'] = new_ids
-    state['id_to_meta']  = new_id_meta
-
-    if added:   log.info(f'Добавлено каналов: {len(added)}')
-    if removed: log.info(f'Убрано каналов: {len(removed)}')
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Фоновая задача: перезагрузка настроек
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def _settings_reload_loop(clients: dict, ss):
-    while True:
-        await asyncio.sleep(SETTINGS_RELOAD_SEC)
-        try:
-            log.info('Перезагрузка настроек...')
-            loop = asyncio.get_event_loop()
-
-            new_settings = await loop.run_in_executor(_executor, _read_settings,      ss)
-            new_rules    = await loop.run_in_executor(_executor, _read_scoring_rules,  ss)
-            new_minus    = await loop.run_in_executor(_executor, _read_minus_words,    ss)
-            new_channels = await loop.run_in_executor(_executor, _read_channels,       ss)
-
-            if new_settings:
-                state.update({
-                    'tg_token':          new_settings['tg_token'],
-                    'score_threshold':   new_settings['score_threshold'],
-                    'min_length':        new_settings['min_length'],
-                    'moderator_chat_id': new_settings['moderator_chat_id'],
-                    'dest_chat_id':      new_settings['dest_chat_id'],
-                })
-
-            if new_rules    is not None: state['scoring_rules'] = new_rules
-            if new_minus    is not None: state['minus_words']   = new_minus
-            if new_channels is not None:
-                await _update_watched_chats(clients, new_channels, ss)
-
-            log.info(
-                f'Настройки применены | каналов: {len(state["watched_ids"])} | '
-                f'правил: {len(state["scoring_rules"])} | '
-                f'минус-слов: {len(state["minus_words"])} | '
-                f'порог: {state["score_threshold"]}'
-            )
-        except Exception as e:
-            log.error('Ошибка перезагрузки настроек: ' + str(e))
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Обработчик новых сообщений (общий для обоих клиентов)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _register_handler(client: TelegramClient, acc_label: str, ss):
-
-    @client.on(events.NewMessage)
+    @client.on(events.NewMessage(chats=chat_ids))
     async def _on_new_message(event):
         try:
             raw_id = event.chat_id
@@ -557,7 +503,7 @@ def _register_handler(client: TelegramClient, acc_label: str, ss):
                 'src_msg_id':  msg.id,
             }
 
-            loop      = asyncio.get_event_loop()
+            loop      = asyncio.get_running_loop()
             tg_token  = state['tg_token']
             threshold = state['score_threshold']
             dest_chat = state['dest_chat_id']
@@ -583,6 +529,158 @@ def _register_handler(client: TelegramClient, acc_label: str, ss):
         except Exception as e:
             log.error(f'[{acc_label}] Ошибка обработки сообщения: {e}')
 
+    _registered_handlers[acc_label] = _on_new_message
+    log.info(f'[{acc_label}] Хендлер зарегистрирован для {len(chat_ids)} каналов')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Управление подпиской на каналы (dual-account с fallback)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _resolve_entity(clients: dict, username: str, ss) -> dict | None:
+    """
+    Пробует резолвить канал через acc1, при ошибке — через acc2.
+    Если оба провалились — шлёт алерт и ставит статус «недоступен».
+    При успехе — дописывает строку в лист «Кэш».
+    Возвращает meta-dict или None.
+    """
+    errors = {}
+    for acc_name, client in clients.items():
+        try:
+            entity    = await client.get_entity(username)
+            eid       = abs(entity.id)
+            chat_name = getattr(entity, 'title', None) or username
+            log.info(f'Резолв [{acc_name}]: {username} → {eid} ({chat_name})')
+
+            # Сохраняем в кэш таблицы
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(_executor, _write_cache_row, ss, username, eid, chat_name)
+
+            return {
+                'entity_id': eid,
+                'chat_name': chat_name,
+                'username':  username,
+            }
+        except FloodWaitError as e:
+            log.warning(f'[{acc_name}] FloodWait при резолве {username}: жду {e.seconds}s')
+            await asyncio.sleep(e.seconds + 2)
+            try:
+                entity    = await client.get_entity(username)
+                eid       = abs(entity.id)
+                chat_name = getattr(entity, 'title', None) or username
+
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(_executor, _write_cache_row, ss, username, eid, chat_name)
+
+                return {'entity_id': eid, 'chat_name': chat_name, 'username': username}
+            except Exception as e2:
+                errors[acc_name] = str(e2)
+        except (ChannelPrivateError, UsernameNotOccupiedError, UsernameInvalidError) as e:
+            errors[acc_name] = str(e)
+            log.warning(f'[{acc_name}] Недоступен {username}: {e}')
+        except Exception as e:
+            errors[acc_name] = str(e)
+            log.error(f'[{acc_name}] Ошибка резолва {username}: {e}')
+
+        await asyncio.sleep(0.5)
+
+    # Оба провалились
+    msg = (
+        f'🚫 Канал недоступен обоим аккаунтам: @{username}\n'
+        f'acc1: {errors.get("acc1", "—")}\n'
+        f'acc2: {errors.get("acc2", "—")}'
+    )
+    log.error(msg)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(_executor, _send_alert, state['tg_token'], state['moderator_chat_id'], msg)
+    await loop.run_in_executor(_executor, _set_channel_status, ss, username, 'недоступен')
+    await loop.run_in_executor(_executor, _write_log, ss, 'ERROR', msg)
+    return None
+
+
+async def _update_watched_chats(clients: dict, channels: list, ss):
+    """
+    Резолвит каналы (используя in-memory кэш), обновляет state,
+    затем перерегистрирует хендлеры с актуальным списком chat_ids.
+    """
+    new_ids     = set()
+    new_id_meta = {}
+
+    for ch in channels:
+        username = ch['username']
+
+        cached = state['username_to_meta'].get(username)
+        if cached and 'entity_id' in cached:
+            eid = cached['entity_id']
+            new_ids.add(eid)
+            new_id_meta[eid] = cached
+            continue
+
+        meta = await _resolve_entity(clients, username, ss)
+        if meta:
+            eid = meta['entity_id']
+            new_ids.add(eid)
+            new_id_meta[eid]                   = meta
+            state['username_to_meta'][username] = meta
+            await asyncio.sleep(0.8)
+
+    added   = new_ids - state['watched_ids']
+    removed = state['watched_ids'] - new_ids
+
+    state['watched_ids'] = new_ids
+    state['id_to_meta']  = new_id_meta
+
+    if added:   log.info(f'Добавлено каналов: {len(added)}')
+    if removed: log.info(f'Убрано каналов: {len(removed)}')
+
+    # Перерегистрируем хендлеры с актуальным списком
+    if state['watched_ids']:
+        chat_ids = list(state['watched_ids'])
+        for acc_name, client in clients.items():
+            _register_handler(client, acc_name, ss, chat_ids)
+    else:
+        log.warning('Список каналов пуст — хендлеры не зарегистрированы')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Фоновая задача: перезагрузка настроек
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _settings_reload_loop(clients: dict, ss):
+    while True:
+        await asyncio.sleep(SETTINGS_RELOAD_SEC)
+        try:
+            log.info('Перезагрузка настроек...')
+            loop = asyncio.get_running_loop()
+
+            new_settings = await loop.run_in_executor(_executor, _read_settings,     ss)
+            new_rules    = await loop.run_in_executor(_executor, _read_scoring_rules, ss)
+            new_minus    = await loop.run_in_executor(_executor, _read_minus_words,   ss)
+            new_channels = await loop.run_in_executor(_executor, _read_channels,      ss)
+
+            if new_settings:
+                state.update({
+                    'tg_token':          new_settings['tg_token'],
+                    'score_threshold':   new_settings['score_threshold'],
+                    'min_length':        new_settings['min_length'],
+                    'moderator_chat_id': new_settings['moderator_chat_id'],
+                    'dest_chat_id':      new_settings['dest_chat_id'],
+                })
+
+            if new_rules  is not None: state['scoring_rules'] = new_rules
+            if new_minus  is not None: state['minus_words']   = new_minus
+            if new_channels is not None:
+                await _update_watched_chats(clients, new_channels, ss)
+
+            log.info(
+                f'Настройки применены | каналов: {len(state["watched_ids"])} | '
+                f'правил: {len(state["scoring_rules"])} | '
+                f'минус-слов: {len(state["minus_words"])} | '
+                f'порог: {state["score_threshold"]}'
+            )
+        except Exception as e:
+            log.error('Ошибка перезагрузки настроек: ' + str(e))
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Точка входа
@@ -591,8 +689,9 @@ def _register_handler(client: TelegramClient, acc_label: str, ss):
 async def main():
     log.info('═══ TG Parser v3 (dual-account) стартует ═══')
 
+    loop = asyncio.get_running_loop()
+
     # ── Google Sheets ──────────────────────────────────────────────────────
-    loop = asyncio.get_event_loop()
     try:
         ss = await loop.run_in_executor(_executor, _get_spreadsheet)
         log.info('Google Sheets: подключён')
@@ -619,6 +718,11 @@ async def main():
         'minus_words':       minus,
     })
 
+    # ── Загрузка кэша резолва из таблицы ──────────────────────────────────
+    cache = await loop.run_in_executor(_executor, _read_cache, ss)
+    state['username_to_meta'].update(cache)
+    log.info(f'Кэш загружен в память: {len(cache)} каналов')
+
     # ── Telegram клиенты ───────────────────────────────────────────────────
     clients = {}
 
@@ -642,21 +746,24 @@ async def main():
         log.error('Ни один аккаунт не подключён — выход')
         return
 
-    # ── Резолв каналов ─────────────────────────────────────────────────────
+    # ── Резолв каналов + регистрация хендлеров ────────────────────────────
+    # _update_watched_chats сам вызовет _register_handler в конце
     if not channels:
         log.warning('Лист «Каналы» пуст — добавьте каналы')
     await _update_watched_chats(clients, channels or [], ss)
     log.info(f'Слежу за {len(state["watched_ids"])} каналами/группами')
+
+    # Если после первого запуска в кэше появились новые записи — перезаписываем
+    # лист целиком (убираем дубли, которые могли накопиться построчной записью)
+    if state['username_to_meta']:
+        entries = list(state['username_to_meta'].values())
+        await loop.run_in_executor(_executor, _rebuild_cache, ss, entries)
 
     await loop.run_in_executor(_executor, _write_log, ss, 'INFO',
         f'Запущен | аккаунтов: {len(clients)} | каналов: {len(state["watched_ids"])} | '
         f'правил: {len(state["scoring_rules"])} | порог: {state["score_threshold"]} | '
         f'минус-слов: {len(state["minus_words"])}'
     )
-
-    # ── Регистрация обработчиков ───────────────────────────────────────────
-    for acc_name, client in clients.items():
-        _register_handler(client, acc_name, ss)
 
     # ── Фоновая перезагрузка настроек ─────────────────────────────────────
     asyncio.create_task(_settings_reload_loop(clients, ss))
