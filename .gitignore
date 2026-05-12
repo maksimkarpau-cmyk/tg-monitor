@@ -1,0 +1,21 @@
+# Секреты — никогда не коммитить
+.env
+*.session
+*.session-journal
+service-account.json
+*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.DS_Store
