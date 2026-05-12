@@ -281,7 +281,7 @@ def _rebuild_cache(ss, entries: list):
         rows = [['username', 'entity_id', 'chat_name']]
         rows += [[e['username'], str(e['entity_id']), e['chat_name']] for e in entries]
         ws.clear()
-        ws.update('A1', rows, value_input_option='USER_ENTERED')
+        ws.update(range_name='A1', values=rows, value_input_option='USER_ENTERED')
         log.info(f'Кэш перезаписан: {len(entries)} записей')
     except Exception as e:
         log.error(f'Ошибка перезаписи кэша: {e}')
