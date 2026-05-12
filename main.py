@@ -1,13 +1,12 @@
 """
 TG Parser v3 — один аккаунт (или два), скоринг + модерация через inline-кнопки.
 
-Исправления по сравнению с оригиналом:
-1. Корневой баг: ID каналов в Telethon при событии приходят в формате -100XXXXXXXXXX,
-   а get_entity() возвращает просто XXXXXXXXXX. Теперь в id_to_meta хранятся оба варианта.
-2. Хендлер регистрируется БЕЗ фильтра chats= (так работает с любым форматом chat_id).
-3. Логирование всех пропущенных сообщений на уровне DEBUG — видно что происходит.
-4. Исправлен DeprecationWarning в gspread: ws.update(values, range_name).
-5. Аккаунт 2 опционален — без него всё работает.
+Ключевые решения:
+- Пересылка в dest-канал идёт через Telethon-аккаунт (не Bot API),
+  поэтому бот НЕ обязан состоять в каналах-источниках.
+- Бот используется только для: карточек модерации (sendMessage + inline-кнопки)
+  и приёма callback_query от кнопок ✅/❌.
+- Весь основной поток (main + хендлер) — в одном месте.
 """
 
 import asyncio
@@ -18,6 +17,7 @@ import os
 import re
 import time
 import urllib.request
+import urllib.parse
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -43,9 +43,9 @@ API_ID_2   = int(os.environ.get('TG_API_ID_2', '0'))
 API_HASH_2 = os.environ.get('TG_API_HASH_2', '')
 SESSION_2  = os.environ.get('TG_SESSION_2', '')
 
-SPREADSHEET_ID       = os.environ.get('SPREADSHEET_ID', '')
+SPREADSHEET_ID         = os.environ.get('SPREADSHEET_ID', '')
 GOOGLE_CREDENTIALS_B64 = os.environ.get('GOOGLE_CREDENTIALS_BASE64', '')
-SETTINGS_RELOAD_SEC  = int(os.environ.get('SETTINGS_RELOAD_INTERVAL', '300'))
+SETTINGS_RELOAD_SEC    = int(os.environ.get('SETTINGS_RELOAD_INTERVAL', '300'))
 
 # ── Логирование ────────────────────────────────────────────────────────────────
 
@@ -59,20 +59,23 @@ log = logging.getLogger(__name__)
 # ── Глобальное состояние ───────────────────────────────────────────────────────
 
 state = {
-    'tg_token': '',
-    'score_threshold': 7,
-    'min_length': 20,
+    'tg_token':          '',
+    'score_threshold':   7,
+    'min_length':        20,
     'moderator_chat_id': '',
-    'dest_chat_id': '',
-    'scoring_rules': [],   # [{'category': str, 'weight': int, 'keywords': [str]}]
-    'minus_words': [],     # [str]
-    'watched_ids': set(),  # все известные abs_id каналов (включая 100-варианты)
-    'id_to_meta': {},      # {any_id_variant: {chat_name, username, entity_id}}
-    'username_to_meta': {},# кэш резолва username → meta
+    'dest_chat_id':      '',
+    'scoring_rules':     [],   # [{'category': str, 'weight': int, 'keywords': [str]}]
+    'minus_words':       [],   # [str]
+    'watched_ids':       set(),
+    'id_to_meta':        {},   # {id_variant: {chat_name, username, entity_id}}
+    'username_to_meta':  {},
 }
 
-# Дедупликация: храним последние 2000 (chat_id, msg_id)
+# Дедупликация входящих сообщений
 seen_ids: deque = deque(maxlen=2000)
+
+# pending_moderation: bot_message_id → post dict  (для обработки callback)
+pending_moderation: dict = {}
 
 _executor = ThreadPoolExecutor(max_workers=4)
 
@@ -212,7 +215,6 @@ def _write_log(ss, level, message, account=''):
 
 
 def _set_channel_status(ss, username: str, status: str):
-    """Обновляет колонку C (Статус) для канала в листе «Каналы»."""
     try:
         ws = ss.worksheet('Каналы')
         data = ws.get_all_values()
@@ -221,11 +223,23 @@ def _set_channel_status(ss, username: str, status: str):
                 continue
             u = _extract_username(row[0].strip())
             if u and u.lower() == username.lower():
-                # ИСПРАВЛЕНО: новый синтаксис gspread
                 ws.update(values=[[status]], range_name=f'C{i}')
                 return
     except Exception as e:
         log.error(f'Ошибка обновления статуса канала {username}: {e}')
+
+
+def _update_rejected_status(ss, bot_message_id: int, new_status: str):
+    """Обновляет статус в листе «Отклонённые» по bot_message_id."""
+    try:
+        ws = ss.worksheet('Отклонённые')
+        data = ws.get_all_values()
+        for i, row in enumerate(data[1:], start=2):
+            if len(row) > 6 and str(row[6]) == str(bot_message_id):
+                ws.update(values=[[new_status]], range_name=f'F{i}')
+                return
+    except Exception as e:
+        log.error(f'Ошибка обновления статуса отклонённого поста: {e}')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -248,23 +262,12 @@ def _extract_username(raw: str):
 
 
 def _all_id_variants(entity_id: int) -> list:
-    """
-    Возвращает все варианты ID, под которыми канал/группа может прийти в event.chat_id.
-
-    Telethon's get_entity() возвращает «голый» ID (например 1234567890).
-    Но event.chat_id для каналов/супергрупп приходит как -1001234567890.
-    abs() от него даёт 1001234567890 — отличается от голого ID.
-
-    Храним все варианты как ключи в id_to_meta, чтобы lookup всегда работал.
-    """
     eid = abs(entity_id)
     variants = [eid]
     s = str(eid)
-    # Добавляем вариант с 100-префиксом (для каналов/супергрупп)
     if not s.startswith('100'):
         variants.append(int('100' + s))
     else:
-        # Добавляем вариант без 100-префикса
         short = int(s[3:])
         if short > 0:
             variants.append(short)
@@ -324,7 +327,7 @@ def _calc_score(text: str, rules: list) -> int:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Telegram Bot API (синхронные вызовы для executor)
+# Telegram Bot API
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _tg_request(token: str, method: str, payload: dict) -> dict:
@@ -333,16 +336,23 @@ def _tg_request(token: str, method: str, payload: dict) -> dict:
     req  = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode('utf-8'))
+            result = json.loads(resp.read().decode('utf-8'))
+            if not result.get('ok'):
+                log.error(f'TG API {method} не ок: {result.get("description")}')
+            return result
     except Exception as e:
         log.error(f'TG API {method} error: {e}')
         return {}
 
 
 def _send_moderation_card(post: dict, token: str, moderator_chat_id: str) -> int:
+    """
+    Отправляет карточку модерации в чат модератора с inline-кнопками ✅/❌.
+    Возвращает message_id бота (для привязки callback).
+    """
     lines = [
-        f'⚠️ Пост не прошёл скоринг (скор: {post["score"]}/{state["score_threshold"]})',
-        f'📢 {post["chat_name"]}',
+        f'⚠️ <b>Пост не прошёл скоринг</b> (скор: {post["score"]}/{state["score_threshold"]})',
+        f'📢 <b>{post["chat_name"]}</b>',
     ]
     if post['author_name']:
         author = post['author_name']
@@ -350,18 +360,44 @@ def _send_moderation_card(post: dict, token: str, moderator_chat_id: str) -> int
             author += f' — {post["author_link"]}'
         lines.append(f'👤 {author}')
     lines += ['', post['text'][:1000], '', f'🔗 {post["link"]}']
+
     result = _tg_request(token, 'sendMessage', {
         'chat_id':    moderator_chat_id,
         'text':       '\n'.join(lines)[:4096],
         'parse_mode': 'HTML',
         'reply_markup': {
             'inline_keyboard': [[
-                {'text': '✅ Отправить', 'callback_data': f'approve:{post["link"]}'},
-                {'text': '❌ Пропустить', 'callback_data': f'skip:{post["link"]}'},
+                # callback_data содержит bot_message_id — он ещё неизвестен здесь,
+                # поэтому кладём уникальный ключ на основе chat+msg
+                {'text': '✅ Опубликовать', 'callback_data': f'approve:{post["src_chat_id"]}:{post["src_msg_id"]}'},
+                {'text': '❌ Пропустить',   'callback_data': f'skip:{post["src_chat_id"]}:{post["src_msg_id"]}'},
             ]]
         },
     })
     return result.get('result', {}).get('message_id', 0)
+
+
+def _answer_callback(token: str, callback_query_id: str, text: str):
+    _tg_request(token, 'answerCallbackQuery', {
+        'callback_query_id': callback_query_id,
+        'text': text,
+        'show_alert': False,
+    })
+
+
+def _edit_message_reply_markup(token: str, chat_id: str, message_id: int, new_text: str):
+    """Убирает кнопки после решения модератора и дописывает статус."""
+    _tg_request(token, 'editMessageReplyMarkup', {
+        'chat_id':      chat_id,
+        'message_id':   message_id,
+        'reply_markup': {'inline_keyboard': []},
+    })
+    # Добавляем статусную строку отдельным сообщением (editMessageText сложнее)
+    _tg_request(token, 'sendMessage', {
+        'chat_id':  chat_id,
+        'text':     new_text,
+        'reply_to_message_id': message_id,
+    })
 
 
 def _send_alert(token: str, moderator_chat_id: str, message: str):
@@ -373,13 +409,13 @@ def _send_alert(token: str, moderator_chat_id: str, message: str):
     })
 
 
-def _forward_message_sync(token: str, from_chat_id, message_id_tg: int, dest_chat_id: str):
-    _tg_request(token, 'forwardMessage', {
-        'chat_id':      dest_chat_id,
-        'from_chat_id': from_chat_id,
-        'message_id':   message_id_tg,
+def _get_updates(token: str, offset: int, timeout: int = 30) -> list:
+    result = _tg_request(token, 'getUpdates', {
+        'offset':  offset,
+        'timeout': timeout,
+        'allowed_updates': ['callback_query'],
     })
-    time.sleep(0.3)
+    return result.get('result', [])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -387,9 +423,6 @@ def _forward_message_sync(token: str, from_chat_id, message_id_tg: int, dest_cha
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _resolve_entity(clients: dict, username: str, ss) -> dict | None:
-    """
-    Пробует резолвить канал через acc1, при ошибке — через acc2.
-    """
     errors = {}
     for acc_name, client in clients.items():
         try:
@@ -397,11 +430,7 @@ async def _resolve_entity(clients: dict, username: str, ss) -> dict | None:
             eid       = abs(entity.id)
             chat_name = getattr(entity, 'title', None) or username
             log.info(f'Резолв [{acc_name}]: {username} → {eid} ({chat_name})')
-            return {
-                'entity_id': eid,
-                'chat_name': chat_name,
-                'username':  username,
-            }
+            return {'entity_id': eid, 'chat_name': chat_name, 'username': username}
         except FloodWaitError as e:
             log.warning(f'[{acc_name}] FloodWait при резолве {username}: жду {e.seconds}s')
             await asyncio.sleep(e.seconds + 2)
@@ -503,119 +532,142 @@ async def _settings_reload_loop(clients: dict, ss):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Обработчик новых сообщений
+# Фоновая задача: long-polling callback_query от бота
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _register_handler(client: TelegramClient, acc_label: str, ss):
+async def _bot_polling_loop(clients: dict, ss):
     """
-    Регистрируем хендлер БЕЗ параметра chats= — так Telethon гарантированно
-    вызывает его для всех входящих событий. Фильтрацию делаем вручную через
-    id_to_meta, где хранятся все варианты ID каждого канала.
-    """
+    Получает callback_query через getUpdates (long-polling).
+    Обрабатывает нажатия ✅ / ❌ от модератора.
 
-    @client.on(events.NewMessage)
-    async def _on_new_message(event):
+    pending_moderation хранит:
+      ключ  = f'{src_chat_id}:{src_msg_id}'   (из callback_data)
+      value = post dict (с полями src_chat_id, src_msg_id, bot_message_id, ...)
+    """
+    offset = 0
+    loop   = asyncio.get_event_loop()
+
+    # Выбираем первый доступный клиент для пересылки
+    def _first_client() -> TelegramClient | None:
+        return next(iter(clients.values()), None)
+
+    while True:
+        token     = state['tg_token']
+        moderator = state['moderator_chat_id']
+        dest_chat = state['dest_chat_id']
+
+        if not token:
+            await asyncio.sleep(5)
+            continue
+
         try:
-            raw_id  = event.chat_id          # например -1001234567890
-            abs_id  = abs(raw_id)            # 1001234567890
-
-            # Ищем по всем вариантам ID
-            meta = state['id_to_meta'].get(abs_id)
-            if meta is None:
-                # Попробуем вариант без/с 100-префиксом
-                s = str(abs_id)
-                if s.startswith('100') and len(s) > 12:
-                    meta = state['id_to_meta'].get(int(s[3:]))
-                else:
-                    meta = state['id_to_meta'].get(int('100' + s))
-
-            if meta is None:
-                log.debug(f'[{acc_label}] Пропущен chat_id={raw_id} (abs={abs_id}) — не в списке')
-                return
-
-            msg = event.message
-            if msg.action is not None:
-                return  # служебное событие (пин, вход и т.д.)
-
-            # ── Дедупликация ───────────────────────────────────────────────
-            dedup_key = (abs_id, msg.id)
-            if dedup_key in seen_ids:
-                return
-            seen_ids.append(dedup_key)
-
-            # ── Текст ──────────────────────────────────────────────────────
-            text = msg.text or msg.message or ''
-            if hasattr(msg, 'caption') and msg.caption:
-                text = msg.caption
-            text = ' '.join(text.split())
-
-            # ── Фильтр 1: минус-слова ──────────────────────────────────────
-            if text and _has_minus_word(text, state['minus_words']):
-                log.debug(f'[{acc_label}][минус-слово] {meta["chat_name"]} — выброс')
-                return
-
-            # ── Фильтр 2: минимальная длина ───────────────────────────────
-            if len(text) < state['min_length']:
-                log.debug(
-                    f'[{acc_label}][короткий] {meta["chat_name"]} '
-                    f'({len(text)} < {state["min_length"]} симв) — выброс'
-                )
-                return
-
-            # ── Скоринг ────────────────────────────────────────────────────
-            score     = _calc_score(text, state['scoring_rules'])
-            chat      = await event.get_chat()
-            link      = _build_link(chat, msg.id)
-            author_name, author_link = _get_author_info(msg)
-            chat_name = meta.get('chat_name', str(abs_id))
-
-            post = {
-                'date':        msg.date.replace(tzinfo=None),
-                'chat_name':   chat_name,
-                'author_name': author_name,
-                'author_link': author_link,
-                'link':        link,
-                'text':        text,
-                'score':       score,
-                'account':     acc_label,
-                'src_chat_id': raw_id,
-                'src_msg_id':  msg.id,
-            }
-
-            loop      = asyncio.get_event_loop()
-            tg_token  = state['tg_token']
-            threshold = state['score_threshold']
-            dest_chat = state['dest_chat_id']
-
-            if score >= threshold:
-                # ── Авто-отправка ──────────────────────────────────────────
-                await loop.run_in_executor(_executor, _write_post, ss, post)
-                log.info(f'[авто ✅ скор:{score} {acc_label}] {chat_name} → {link}')
-                if tg_token and dest_chat:
-                    await loop.run_in_executor(
-                        _executor, _forward_message_sync,
-                        tg_token, raw_id, msg.id, dest_chat,
-                    )
-            else:
-                # ── На модерацию ───────────────────────────────────────────
-                moderator = state['moderator_chat_id']
-                log.info(
-                    f'[модерация ⏳ скор:{score}/{threshold} {acc_label}] '
-                    f'{chat_name} → {link}'
-                )
-                bot_msg_id = 0
-                if tg_token and moderator:
-                    bot_msg_id = await loop.run_in_executor(
-                        _executor, _send_moderation_card, post, tg_token, moderator,
-                    )
-                await loop.run_in_executor(_executor, _write_rejected, ss, post, bot_msg_id)
-
+            updates = await loop.run_in_executor(
+                _executor, _get_updates, token, offset, 30
+            )
         except Exception as e:
-            log.error(f'[{acc_label}] Ошибка обработки сообщения: {e}', exc_info=True)
+            log.error(f'[bot_polling] getUpdates error: {e}')
+            await asyncio.sleep(5)
+            continue
+
+        for upd in updates:
+            offset = upd['update_id'] + 1
+            cq = upd.get('callback_query')
+            if not cq:
+                continue
+
+            cq_id   = cq['id']
+            data    = cq.get('data', '')
+            from_id = cq.get('from', {}).get('id', '')
+            msg_id  = cq.get('message', {}).get('message_id', 0)
+
+            # Парсим callback_data: 'approve:SRC_CHAT_ID:SRC_MSG_ID'
+            parts = data.split(':', 2)
+            if len(parts) != 3 or parts[0] not in ('approve', 'skip'):
+                await loop.run_in_executor(
+                    _executor, _answer_callback, token, cq_id, '⚠️ Неизвестная команда'
+                )
+                continue
+
+            action, src_chat_id_str, src_msg_id_str = parts
+            pend_key = f'{src_chat_id_str}:{src_msg_id_str}'
+            post     = pending_moderation.get(pend_key)
+
+            if not post:
+                await loop.run_in_executor(
+                    _executor, _answer_callback, token, cq_id,
+                    '⚠️ Пост уже обработан или не найден в памяти'
+                )
+                # Убираем кнопки у устаревшей карточки
+                await loop.run_in_executor(
+                    _executor, _edit_message_reply_markup,
+                    token, moderator, msg_id, '⚠️ Пост не найден в очереди'
+                )
+                continue
+
+            if action == 'approve':
+                # ── Публикуем через Telethon ───────────────────────────────
+                client = _first_client()
+                if client and dest_chat:
+                    try:
+                        await client.forward_messages(
+                            entity=int(dest_chat),
+                            messages=int(src_msg_id_str),
+                            from_peer=int(src_chat_id_str),
+                        )
+                        log.info(
+                            f'[модерация ✅ одобрено] '
+                            f'{post["chat_name"]} → {post["link"]}'
+                        )
+                        # Пишем в лист «Посты»
+                        await loop.run_in_executor(_executor, _write_post, ss, post)
+                        # Обновляем статус в «Отклонённых»
+                        await loop.run_in_executor(
+                            _executor, _update_rejected_status,
+                            ss, post.get('bot_message_id', 0), 'одобрено'
+                        )
+                        await loop.run_in_executor(
+                            _executor, _answer_callback, token, cq_id, '✅ Опубликовано!'
+                        )
+                        await loop.run_in_executor(
+                            _executor, _edit_message_reply_markup,
+                            token, moderator, msg_id,
+                            f'✅ Опубликовано модератором {from_id}'
+                        )
+                    except Exception as e:
+                        log.error(f'[модерация] Ошибка пересылки одобренного: {e}')
+                        await loop.run_in_executor(
+                            _executor, _answer_callback, token, cq_id,
+                            f'❌ Ошибка пересылки: {e}'
+                        )
+                else:
+                    await loop.run_in_executor(
+                        _executor, _answer_callback, token, cq_id,
+                        '⚠️ Нет клиента или dest_chat_id'
+                    )
+
+            elif action == 'skip':
+                log.info(f'[модерация ❌ пропущено] {post["chat_name"]} → {post["link"]}')
+                await loop.run_in_executor(
+                    _executor, _update_rejected_status,
+                    ss, post.get('bot_message_id', 0), 'пропущено'
+                )
+                await loop.run_in_executor(
+                    _executor, _answer_callback, token, cq_id, '❌ Пост пропущен'
+                )
+                await loop.run_in_executor(
+                    _executor, _edit_message_reply_markup,
+                    token, moderator, msg_id,
+                    f'❌ Пропущено модератором {from_id}'
+                )
+
+            # Удаляем из очереди после обработки
+            pending_moderation.pop(pend_key, None)
+
+        await asyncio.sleep(0)  # отдаём управление event-loop'у
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Точка входа
+# MAIN — регистрация хендлера + запуск
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def main():
@@ -656,7 +708,7 @@ async def main():
     )
 
     # ── Telegram клиенты ───────────────────────────────────────────────────
-    clients = {}
+    clients: dict[str, TelegramClient] = {}
 
     if SESSION_1 and API_ID_1 and API_HASH_1:
         c1 = TelegramClient(StringSession(SESSION_1), API_ID_1, API_HASH_1)
@@ -685,12 +737,129 @@ async def main():
         log.info(f'Резолвим {len(channels)} каналов...')
 
     await _update_watched_chats(clients, channels or [], ss)
-    log.info(f'Слежу за {len(state["watched_ids"])} ID-ключами ({len(state["username_to_meta"])} каналов)')
+    log.info(
+        f'Слежу за {len(state["watched_ids"])} ID-ключами '
+        f'({len(state["username_to_meta"])} каналов)'
+    )
 
-    # ── Регистрация обработчиков ───────────────────────────────────────────
-    for acc_name, client in clients.items():
-        _register_handler(client, acc_name, ss)
-        log.info(f'[{acc_name}] Хендлер зарегистрирован')
+    # ══════════════════════════════════════════════════════════════════════
+    # Хендлер новых сообщений — регистрируем для каждого клиента здесь,
+    # в main(), чтобы всё было в одном месте.
+    # Пересылка идёт через Telethon (тот же client), бот — только для карточек.
+    # ══════════════════════════════════════════════════════════════════════
+
+    for acc_label, client in clients.items():
+
+        @client.on(events.NewMessage)
+        async def _on_new_message(event, _acc=acc_label, _client=client):
+            try:
+                raw_id = event.chat_id   # -1001234567890
+                abs_id = abs(raw_id)     #  1001234567890
+
+                # Ищем мета по всем вариантам ID
+                meta = state['id_to_meta'].get(abs_id)
+                if meta is None:
+                    s = str(abs_id)
+                    alt = int(s[3:]) if s.startswith('100') and len(s) > 12 else int('100' + s)
+                    meta = state['id_to_meta'].get(alt)
+
+                if meta is None:
+                    log.debug(f'[{_acc}] Пропущен chat_id={raw_id} — не в списке')
+                    return
+
+                msg = event.message
+                if msg.action is not None:
+                    return  # служебное (пин, вход и т.д.)
+
+                # ── Дедупликация ───────────────────────────────────────────
+                dedup_key = (abs_id, msg.id)
+                if dedup_key in seen_ids:
+                    return
+                seen_ids.append(dedup_key)
+
+                # ── Текст ──────────────────────────────────────────────────
+                text = msg.text or msg.message or ''
+                if hasattr(msg, 'caption') and msg.caption:
+                    text = msg.caption
+                text = ' '.join(text.split())
+
+                # ── Фильтр: минус-слова ────────────────────────────────────
+                if text and _has_minus_word(text, state['minus_words']):
+                    log.debug(f'[{_acc}][минус-слово] {meta["chat_name"]} — выброс')
+                    return
+
+                # ── Фильтр: минимальная длина ─────────────────────────────
+                if len(text) < state['min_length']:
+                    log.debug(
+                        f'[{_acc}][короткий] {meta["chat_name"]} '
+                        f'({len(text)} < {state["min_length"]} симв) — выброс'
+                    )
+                    return
+
+                # ── Скоринг ────────────────────────────────────────────────
+                score     = _calc_score(text, state['scoring_rules'])
+                chat      = await event.get_chat()
+                link      = _build_link(chat, msg.id)
+                author_name, author_link = _get_author_info(msg)
+                chat_name = meta.get('chat_name', str(abs_id))
+
+                post = {
+                    'date':        msg.date.replace(tzinfo=None),
+                    'chat_name':   chat_name,
+                    'author_name': author_name,
+                    'author_link': author_link,
+                    'link':        link,
+                    'text':        text,
+                    'score':       score,
+                    'account':     _acc,
+                    'src_chat_id': raw_id,
+                    'src_msg_id':  msg.id,
+                }
+
+                tg_token  = state['tg_token']
+                threshold = state['score_threshold']
+                dest_chat = state['dest_chat_id']
+                moderator = state['moderator_chat_id']
+
+                if score >= threshold:
+                    # ── Авто-публикация через Telethon ─────────────────────
+                    await loop.run_in_executor(_executor, _write_post, ss, post)
+                    log.info(f'[авто ✅ скор:{score} {_acc}] {chat_name} → {link}')
+                    if dest_chat:
+                        try:
+                            await _client.forward_messages(
+                                entity=int(dest_chat),
+                                messages=msg.id,
+                                from_peer=raw_id,
+                            )
+                        except Exception as e:
+                            log.error(f'[{_acc}] Ошибка авто-пересылки: {e}')
+                else:
+                    # ── На модерацию: карточка с inline-кнопками ───────────
+                    log.info(
+                        f'[модерация ⏳ скор:{score}/{threshold} {_acc}] '
+                        f'{chat_name} → {link}'
+                    )
+                    bot_msg_id = 0
+                    if tg_token and moderator:
+                        bot_msg_id = await loop.run_in_executor(
+                            _executor, _send_moderation_card, post, tg_token, moderator,
+                        )
+
+                    post['bot_message_id'] = bot_msg_id
+
+                    # Кладём в очередь для _bot_polling_loop
+                    pend_key = f'{raw_id}:{msg.id}'
+                    pending_moderation[pend_key] = post
+
+                    await loop.run_in_executor(
+                        _executor, _write_rejected, ss, post, bot_msg_id
+                    )
+
+            except Exception as e:
+                log.error(f'[{_acc}] Ошибка обработки сообщения: {e}', exc_info=True)
+
+        log.info(f'[{acc_label}] Хендлер зарегистрирован')
 
     # ── Запись в лог таблицы ───────────────────────────────────────────────
     await loop.run_in_executor(_executor, _write_log, ss, 'INFO',
@@ -701,9 +870,14 @@ async def main():
         f'минус-слов: {len(state["minus_words"])}'
     )
 
-    # ── Фоновая перезагрузка настроек ─────────────────────────────────────
+    # ── Фоновые задачи ─────────────────────────────────────────────────────
     asyncio.create_task(_settings_reload_loop(clients, ss))
-    log.info(f'Слушаю события. Настройки обновляются каждые {SETTINGS_RELOAD_SEC}с')
+    asyncio.create_task(_bot_polling_loop(clients, ss))
+    log.info(
+        f'Слушаю события. '
+        f'Настройки обновляются каждые {SETTINGS_RELOAD_SEC}с. '
+        f'Bot polling запущен.'
+    )
 
     # ── Держим всех клиентов живыми ────────────────────────────────────────
     await asyncio.gather(*[c.run_until_disconnected() for c in clients.values()])
