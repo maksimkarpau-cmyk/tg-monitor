@@ -1475,6 +1475,7 @@ async def main():
 
         @client.on(events.NewMessage)
         async def _on_new_message(event, _acc=acc_label, _client=client):
+            log.info(f'[{_acc}] RAW chat_id={event.chat_id}')
             try:
                 raw_id = event.chat_id
                 abs_id = abs(raw_id)
@@ -1498,7 +1499,7 @@ async def main():
                     meta = id_to_meta.get(alt)
 
                 if meta is None:
-                    log.debug(f'[{_acc}] Пропущен chat_id={raw_id} — не в списке')
+                    log.debug(f'[{_acc}] Пропущен chat_id={raw_id} (abs={abs_id}) — не в списке')
                     return
 
                 msg = event.message
