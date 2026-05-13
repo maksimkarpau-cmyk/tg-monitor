@@ -502,7 +502,13 @@ def _text_to_html(text: str, entities) -> str:
 def _has_minus_word(text: str, minus_words: list) -> bool:
     lower = text.lower()
     return any(w in lower for w in minus_words if w)
-
+    
+def _find_minus_word(text: str, minus_words: list) -> str | None:
+    lower = text.lower()
+    for w in minus_words:
+        if w and w in lower:
+            return w
+    return None
 
 def _calc_score(text: str, rules: list) -> int:
     lower = text.lower()
@@ -1270,8 +1276,9 @@ async def main():
 
             chat_name = meta.get('chat_name', str(abs_id))
 
-            if _has_minus_word(text, minus_words):
-                log.info(f'[{_acc}][альбом минус-слово] {chat_name}')
+            minus_hit = _find_minus_word(text, minus_words)
+            if minus_hit:
+                log.info(f'[{_acc}][альбом минус "{minus_hit}"] {chat_name} | {repr(text[:80])}')
                 return
             if len(text) < min_length:
                 log.info(f'[{_acc}][альбом короткий {len(text)}<{min_length}] {chat_name}')
@@ -1405,8 +1412,9 @@ async def main():
                 log.info(f'[{_acc}][текст] {meta["chat_name"]} | score_would_be:{_calc_score(text, scoring_rules)} | minus:{_has_minus_word(text, minus_words)} | len:{len(text)} | {repr(text[:120])}')
                 html_text = _text_to_html(text, msg.entities)
 
-                if _has_minus_word(text, minus_words):
-                    log.info(f'[{_acc}][минус-слово] {chat_name}')
+                minus_hit = _find_minus_word(text, minus_words)
+                if minus_hit:
+                    log.info(f'[{_acc}][минус "{minus_hit}"] {chat_name} | {repr(text[:80])}')
                     return
 
                 if len(text) < min_length:
