@@ -7,6 +7,26 @@ TG Parser v3 — один аккаунт (или два), скоринг + мо�
 - Бот используется только для: карточек модерации (sendMessage + inline-кнопки)
   и приёма callback_query от кнопок ✅/❌.
 - Весь основной поток (main + хендлер) — в одном месте.
+
+Исправленные баги (см. баги.txt):
+  1.  album_buffer не защищён от исключений — pop до try, except логирует traceback.
+  2.  pending_moderation утекает — TTL-cleanup раз в час, записи старше 24ч удаляются.
+  3.  grouped_msgs хранит живые Telethon-объекты — заменено на (chat_id, msg_id) refs,
+      fetch при одобрении.
+  4.  gspread не thread-safe — asyncio.Lock (_sheets_lock) вокруг каждого Sheets-вызова.
+  5.  published_fingerprints: check+append не атомарны — fp добавляется ДО первого await.
+  6.  state.update без блокировки — asyncio.Lock (_state_lock) при записи и чтении копии.
+  7.  Нет retry при Sheets 429/500 — _write_with_retry с exponential backoff.
+  8.  _get_updates не различает error_code — поднимает RuntimeError('409:...') при Conflict;
+      _bot_polling_loop при старте ждёт освобождения слота, в цикле — backoff + повтор deleteWebhook.
+  9.  raw_id в _flush_album получается ненадёжно — один источник first.chat_id с fallback.
+  10. seen_ids дедуплицирует по abs_id — исправлено на raw_id (с сохранением знака).
+  11. _all_id_variants ломается на коротких channel_id — граничные условия защищены.
+  12. _text_to_html смещения в UTF-16, а chars — Unicode — добавлена конвертация.
+  13. Логирование без traceback во многих except — везде добавлен exc_info=True.
+  14. Нет graceful shutdown — SIGTERM дожидается flush всех album_buffer.
+  15. Метрики / heartbeat — счётчики + _heartbeat_loop каждые 5 мин.
+  16. ThreadPoolExecutor расширен до 8 воркеров (опционально из env).
 """
 import asyncio
 import base64
@@ -15,9 +35,11 @@ import json
 import logging
 import os
 import re
+import signal
 import time
 import urllib.request
 import urllib.parse
+import unicodedata
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -46,6 +68,7 @@ SESSION_2  = os.environ.get('TG_SESSION_2', '')
 SPREADSHEET_ID         = os.environ.get('SPREADSHEET_ID', '')
 GOOGLE_CREDENTIALS_B64 = os.environ.get('GOOGLE_CREDENTIALS_BASE64', '')
 SETTINGS_RELOAD_SEC    = int(os.environ.get('SETTINGS_RELOAD_INTERVAL', '300'))
+EXECUTOR_WORKERS       = int(os.environ.get('EXECUTOR_WORKERS', '8'))
 
 # ── Логирование ────────────────────────────────────────────────────────────────
 
@@ -60,8 +83,8 @@ log = logging.getLogger(__name__)
 
 state = {
     'tg_token':             '',
-    'score_threshold':      7,   # минимальный скор для авто-публикации
-    'moderation_threshold': 4,   # минимальный скор для отправки на модерацию
+    'score_threshold':      7,
+    'moderation_threshold': 4,
     'min_length':           20,
     'moderator_chat_id':    '',
     'dest_chat_id':         '',
@@ -72,21 +95,26 @@ state = {
     'username_to_meta':     {},
 }
 
-# Часовой пояс для записи в таблицу (GMT+3)
 TZ_OFFSET_HOURS = 3
 
-# Дедупликация входящих сообщений (chat_id, msg_id)
+# БАГ 10 fix: храним raw_id (со знаком), не abs_id
 seen_ids: deque = deque(maxlen=2000)
 
-# Дедупликация опубликованных постов по тексту+автору
-# Храним (fingerprint) последних 500 опубликованных, чтобы не дублировать
-# одно объявление из нескольких групп.
 published_fingerprints: deque = deque(maxlen=500)
 
-# pending_moderation: '{src_chat_id}:{src_msg_id}' → post dict
+# БАГ 2 fix: значение хранит 'added_at' для TTL-cleanup
 pending_moderation: dict = {}
 
-_executor = ThreadPoolExecutor(max_workers=4)
+_executor = ThreadPoolExecutor(max_workers=EXECUTOR_WORKERS)
+
+# БАГ 4 fix: asyncio.Lock для gspread (не thread-safe)
+_sheets_lock: asyncio.Lock | None = None   # инициализируется в main()
+
+# БАГ 6 fix: asyncio.Lock для чтения/записи state
+_state_lock: asyncio.Lock | None = None    # инициализируется в main()
+
+# БАГ 15 fix: счётчики метрик
+metrics = {'processed': 0, 'published': 0, 'moderated': 0, 'errors': 0}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -102,6 +130,56 @@ def _get_spreadsheet():
     creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
     gc = gspread.authorize(creds)
     return gc.open_by_key(SPREADSHEET_ID)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Google Sheets — retry-обёртка (БАГ 7)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _write_with_retry(fn, *args, max_attempts: int = 3):
+    """Вызывает fn(*args) с exponential backoff при 429/500 от Sheets API."""
+    for attempt in range(max_attempts):
+        try:
+            fn(*args)
+            return
+        except gspread.exceptions.APIError as e:
+            code = getattr(e.response, 'status_code', 0)
+            if code in (429, 500):
+                wait = (2 ** attempt) * 5
+                log.warning(f'Sheets {code} — retry через {wait}s (попытка {attempt + 1})')
+                time.sleep(wait)
+            else:
+                log.error(f'Sheets APIError: {e}', exc_info=True)
+                return
+        except Exception as e:
+            log.error(f'Sheets write failed: {e}', exc_info=True)
+            return
+    log.error(f'Sheets write окончательно не удалась после {max_attempts} попыток')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Google Sheets — безопасные async-обёртки (БАГ 4)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _safe_sheets(fn, *args):
+    """Выполняет fn(*args) в executor под _sheets_lock."""
+    loop = asyncio.get_event_loop()
+    async with _sheets_lock:
+        await loop.run_in_executor(_executor, fn, *args)
+
+
+async def _safe_sheets_retry(fn, *args):
+    """Выполняет fn(*args) через _write_with_retry под _sheets_lock."""
+    loop = asyncio.get_event_loop()
+    async with _sheets_lock:
+        await loop.run_in_executor(_executor, _write_with_retry, fn, *args)
+
+
+async def _safe_sheets_result(fn, *args):
+    """Выполняет fn(*args) в executor под _sheets_lock, возвращает результат."""
+    loop = asyncio.get_event_loop()
+    async with _sheets_lock:
+        return await loop.run_in_executor(_executor, fn, *args)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -122,7 +200,7 @@ def _read_settings(ss):
             'moderation_threshold': int(val(6) or 4),
         }
     except Exception as e:
-        log.error('Ошибка чтения настроек: ' + str(e))
+        log.error('Ошибка чтения настроек: ' + str(e), exc_info=True)
         return None
 
 
@@ -143,7 +221,7 @@ def _read_scoring_rules(ss):
                 rules.append({'category': row[0].strip(), 'weight': weight, 'keywords': keywords})
         return rules
     except Exception as e:
-        log.error('Ошибка чтения скоринга: ' + str(e))
+        log.error('Ошибка чтения скоринга: ' + str(e), exc_info=True)
         return []
 
 
@@ -152,7 +230,7 @@ def _read_minus_words(ss):
         data = ss.worksheet('Минус-слова').get_all_values()
         return [str(row[0]).strip().lower() for row in data[1:] if row and row[0].strip()]
     except Exception as e:
-        log.error('Ошибка чтения минус-слов: ' + str(e))
+        log.error('Ошибка чтения минус-слов: ' + str(e), exc_info=True)
         return []
 
 
@@ -171,7 +249,7 @@ def _read_channels(ss):
                 result.append({'username': username})
         return result
     except Exception as e:
-        log.error('Ошибка чтения каналов: ' + str(e))
+        log.error('Ошибка чтения каналов: ' + str(e), exc_info=True)
         return []
 
 
@@ -180,17 +258,15 @@ def _read_channels(ss):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _local_now() -> datetime:
-    """Текущее время GMT+3 (без зависимости от pytz/zoneinfo)."""
     from datetime import timezone, timedelta
-    tz_utc = timezone.utc
+    tz_utc   = timezone.utc
     tz_local = timezone(timedelta(hours=TZ_OFFSET_HOURS))
     return datetime.now(tz_utc).astimezone(tz_local).replace(tzinfo=None)
 
 
 def _local_dt(dt: datetime) -> datetime:
-    """Конвертирует UTC datetime в GMT+3. dt ожидается naive (без tzinfo)."""
     from datetime import timezone, timedelta
-    tz_utc = timezone.utc
+    tz_utc   = timezone.utc
     tz_local = timezone(timedelta(hours=TZ_OFFSET_HOURS))
     return dt.replace(tzinfo=tz_utc).astimezone(tz_local).replace(tzinfo=None)
 
@@ -208,7 +284,8 @@ def _write_post(ss, post):
             post['account'],
         ], value_input_option='USER_ENTERED')
     except Exception as e:
-        log.error('Ошибка записи поста: ' + str(e))
+        log.error('Ошибка записи поста: ' + str(e), exc_info=True)
+        raise  # пробрасываем для _write_with_retry
 
 
 def _write_rejected(ss, post, bot_message_id):
@@ -224,7 +301,8 @@ def _write_rejected(ss, post, bot_message_id):
             post['account'],
         ], value_input_option='USER_ENTERED')
     except Exception as e:
-        log.error('Ошибка записи отклонённого поста: ' + str(e))
+        log.error('Ошибка записи отклонённого поста: ' + str(e), exc_info=True)
+        raise
 
 
 def _write_log(ss, level, message, account=''):
@@ -237,11 +315,10 @@ def _write_log(ss, level, message, account=''):
             value_input_option='USER_ENTERED',
         )
     except Exception as e:
-        log.error('Ошибка записи лога: ' + str(e))
+        log.error('Ошибка записи лога: ' + str(e), exc_info=True)
 
 
 def _read_entity_cache(ss) -> dict:
-    """Читает лист «Кеш» → {username: {entity_id, chat_name, username}}"""
     try:
         try:
             ws = ss.worksheet('Кеш')
@@ -263,12 +340,11 @@ def _read_entity_cache(ss) -> dict:
         log.info(f'Кеш загружен: {len(result)} каналов')
         return result
     except Exception as e:
-        log.error(f'Ошибка чтения кеша: {e}')
+        log.error(f'Ошибка чтения кеша: {e}', exc_info=True)
         return {}
 
 
 def _write_entity_cache(ss):
-    """Записывает state['username_to_meta'] в лист «Кеш»."""
     try:
         try:
             ws = ss.worksheet('Кеш')
@@ -285,12 +361,12 @@ def _write_entity_cache(ss):
         ws.update(rows, value_input_option='USER_ENTERED')
         log.info(f'Кеш записан: {len(rows) - 1} каналов')
     except Exception as e:
-        log.error(f'Ошибка записи кеша: {e}')
+        log.error(f'Ошибка записи кеша: {e}', exc_info=True)
 
 
 def _set_channel_status(ss, username: str, status: str):
     try:
-        ws = ss.worksheet('Каналы')
+        ws   = ss.worksheet('Каналы')
         data = ws.get_all_values()
         for i, row in enumerate(data[1:], start=2):
             if not row:
@@ -300,20 +376,19 @@ def _set_channel_status(ss, username: str, status: str):
                 ws.update(values=[[status]], range_name=f'C{i}')
                 return
     except Exception as e:
-        log.error(f'Ошибка обновления статуса канала {username}: {e}')
+        log.error(f'Ошибка обновления статуса канала {username}: {e}', exc_info=True)
 
 
 def _update_rejected_status(ss, bot_message_id: int, new_status: str):
-    """Обновляет статус в листе «Отклонённые» по bot_message_id."""
     try:
-        ws = ss.worksheet('Отклонённые')
+        ws   = ss.worksheet('Отклонённые')
         data = ws.get_all_values()
         for i, row in enumerate(data[1:], start=2):
             if len(row) > 6 and str(row[6]) == str(bot_message_id):
                 ws.update(values=[[new_status]], range_name=f'F{i}')
                 return
     except Exception as e:
-        log.error(f'Ошибка обновления статуса отклонённого поста: {e}')
+        log.error(f'Ошибка обновления статуса отклонённого поста: {e}', exc_info=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -335,17 +410,24 @@ def _extract_username(raw: str):
     return None
 
 
+# БАГ 11 fix: корректная обработка граничных значений channel_id
 def _all_id_variants(entity_id: int) -> list:
     eid = abs(entity_id)
-    variants = [eid]
+    variants: set[int] = {eid}
     s = str(eid)
-    if not s.startswith('100'):
-        variants.append(int('100' + s))
-    else:
-        short = int(s[3:])
-        if short > 0:
-            variants.append(short)
-    return variants
+    try:
+        # Если id уже начинается на 100 и достаточно длинный — пробуем короткий вариант
+        if s.startswith('100') and len(s) > 12:
+            short = int(s[3:])
+            if short > 0:
+                variants.add(short)
+        else:
+            # Добавляем вариант с префиксом 100
+            long_id = int('100' + s)
+            variants.add(long_id)
+    except ValueError:
+        pass
+    return list(variants)
 
 
 def _build_link(chat, msg_id: int) -> str:
@@ -374,10 +456,23 @@ def _get_author_info(msg):
     except Exception:
         return '', ''
 
+
+# БАГ 12 fix: корректная конвертация UTF-16 offset → Unicode index
+def _utf16_to_unicode_idx(text: str, utf16_offset: int) -> int:
+    """Конвертирует UTF-16 code unit offset в индекс Unicode-символа."""
+    idx = 0
+    u16 = 0
+    for ch in text:
+        if u16 >= utf16_offset:
+            break
+        u16 += 2 if ord(ch) > 0xFFFF else 1
+        idx += 1
+    return idx
+
+
 def _text_to_html(text: str, entities) -> str:
     if not text:
         return ''
-    # Экранируем HTML-спецсимволы в plain-тексте
     escaped = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
     if not entities:
         return escaped
@@ -388,15 +483,15 @@ def _text_to_html(text: str, entities) -> str:
         MessageEntityTextUrl, MessageEntityUrl, MessageEntityMention,
     )
 
-    # Telegram offsets — в UTF-16 code units
-    chars = list(text)  # список символов Unicode
-    # Строим массив меток: на каждую позицию символа — какие теги открыть/закрыть
+    chars         = list(text)
+    escaped_chars = list(escaped)
     opens  = {}
     closes = {}
 
     for ent in sorted(entities, key=lambda e: (e.offset, -e.length)):
-        o = ent.offset
-        c = ent.offset + ent.length
+        # БАГ 12: конвертируем UTF-16 offsets в Unicode-индексы
+        o = _utf16_to_unicode_idx(text, ent.offset)
+        c = _utf16_to_unicode_idx(text, ent.offset + ent.length)
 
         if isinstance(ent, MessageEntityBold):
             tag_o, tag_c = '<b>', '</b>'
@@ -425,21 +520,19 @@ def _text_to_html(text: str, entities) -> str:
         opens.setdefault(o, []).append(tag_o)
         closes.setdefault(c, []).insert(0, tag_c)
 
-    # Собираем результат
     result = []
-    escaped_chars = list(escaped)  # уже экранированные символы (1:1 с chars по индексу)
     for i in range(len(chars)):
         for tag in closes.get(i, []):
             result.append(tag)
         for tag in opens.get(i, []):
             result.append(tag)
         result.append(escaped_chars[i])
-    # Закрывающие теги после последнего символа
     for tag in closes.get(len(chars), []):
         result.append(tag)
 
     return ''.join(result)
-  
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Фильтрация и скоринг
 # ══════════════════════════════════════════════════════════════════════════════
@@ -477,11 +570,31 @@ def _tg_request(token: str, method: str, payload: dict, timeout: int = 10) -> di
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             result = json.loads(resp.read().decode('utf-8'))
             if not result.get('ok'):
-                log.error(f'TG API {method} не ок: {result.get("description")}')
+                log.error(f'TG API {method} не ок: {result.get("description")} (error_code={result.get("error_code")})')
             return result
     except Exception as e:
-        log.error(f'TG API {method} error: {e}')
+        log.error(f'TG API {method} error: {e}', exc_info=True)
         return {}
+
+
+# БАГ 8 fix: _get_updates поднимает RuntimeError при 409/Conflict
+def _get_updates(token: str, offset: int, timeout: int = 30) -> list:
+    result = _tg_request(token, 'getUpdates', {
+        'offset':  offset,
+        'timeout': timeout,
+        'allowed_updates': ['callback_query'],
+    }, timeout=timeout + 10)
+
+    if not result.get('ok'):
+        error_code  = result.get('error_code', 0)
+        description = result.get('description', '')
+        if error_code == 409 or 'Conflict' in description:
+            raise RuntimeError(f'409:{description}')
+        if error_code in (401, 403):
+            raise RuntimeError(f'{error_code}:{description}')
+        return []
+
+    return result.get('result', [])
 
 
 def _send_moderation_card(post: dict, token: str, moderator_chat_id: str) -> int:
@@ -492,7 +605,6 @@ def _send_moderation_card(post: dict, token: str, moderator_chat_id: str) -> int
         else:
             author_str = post['author_name']
 
-    # Ключ для pending_moderation
     pend_key = f'{post["src_chat_id"]}:{post["src_msg_id"]}'
 
     lines = [
@@ -530,7 +642,6 @@ def _answer_callback(token: str, callback_query_id: str, text: str):
 
 
 def _edit_message_reply_markup(token: str, chat_id: str, message_id: int, new_text: str):
-    """Убирает кнопки после решения модератора и дописывает статус реплаем."""
     _tg_request(token, 'editMessageReplyMarkup', {
         'chat_id':      chat_id,
         'message_id':   message_id,
@@ -555,12 +666,6 @@ def _send_alert(token: str, moderator_chat_id: str, message: str):
 # ── Fingerprint для дедупликации опубликованных постов ─────────────────────────
 
 def _post_fingerprint(text: str, author_name: str) -> str:
-    """
-    Нормализованный ключ (текст + автор) для поиска дублей.
-    Убираем пунктуацию/пробелы, берём первые 120 символов текста —
-    этого достаточно чтобы поймать «чуть изменённые» копии.
-    """
-    import unicodedata
     norm = unicodedata.normalize('NFKC', text.lower())
     norm = re.sub(r'[\s\W]+', '', norm)[:120]
     author_key = re.sub(r'\s+', '', author_name.lower())
@@ -570,15 +675,6 @@ def _post_fingerprint(text: str, author_name: str) -> str:
 # ── Форматирование подписи поста ──────────────────────────────────────────────
 
 def _build_caption(post: dict) -> str:
-    """
-    Собирает подпись поста:
-      <оригинальный текст>
-
-      <a href="ссылка">Название канала</a> · <a href="ссылка_автора">Имя автора</a>
-
-    Текст НЕ нормализуется — переносы строк и форматирование сохраняются.
-    Обрезается до 1024 символов (лимит caption у Bot API / Telethon).
-    """
     link        = post['link']
     chat_name   = post.get('chat_name', '') or 'Источник'
     source_html = f'<a href="{link}">{chat_name}</a>'
@@ -594,8 +690,7 @@ def _build_caption(post: dict) -> str:
         footer = source_html
 
     text = post['text']
-    # Оставляем место под футер (~80 символов)
-    max_text = 1024 - len(footer) - 4  # 4 = '\n\n' + запас
+    max_text = 1024 - len(footer) - 4
     if len(text) > max_text:
         text = text[:max_text].rstrip() + '…'
 
@@ -606,7 +701,6 @@ def _build_caption(post: dict) -> str:
 
 def _bot_request_raw(url: str, data: bytes, content_type: str,
                      timeout: int = 30, label: str = '') -> dict:
-    """Выполняет multipart или JSON запрос к Bot API с retry на 429."""
     req = urllib.request.Request(
         url, data=data, headers={'Content-Type': content_type}
     )
@@ -623,21 +717,15 @@ def _bot_request_raw(url: str, data: bytes, content_type: str,
                 log.warning(f'[{label}] Bot API 429 — жду {retry_after}s')
                 time.sleep(retry_after + 1)
             else:
-                log.error(f'[{label}] Bot API HTTP {e.code}: {e}')
+                log.error(f'[{label}] Bot API HTTP {e.code}: {e}', exc_info=True)
                 return {}
         except Exception as e:
-            log.error(f'[{label}] Bot API error: {e}')
+            log.error(f'[{label}] Bot API error: {e}', exc_info=True)
             return {}
     return {}
 
 
 def _build_multipart(fields: dict, files: dict) -> tuple[bytes, str]:
-    """
-    Собирает multipart/form-data вручную (без внешних зависимостей).
-    fields: {name: str_value}
-    files:  {name: (filename, bytes_data, mime)}
-    Возвращает (body_bytes, content_type_header).
-    """
     boundary = 'B' + str(int(time.time() * 1000))
     parts = []
     for name, value in fields.items():
@@ -657,7 +745,6 @@ def _build_multipart(fields: dict, files: dict) -> tuple[bytes, str]:
 
 
 def _send_photo_bot(token: str, chat_id: str, caption: str, photo: bytes):
-    """Отправляет одно фото через Bot API sendPhoto."""
     url = f'https://api.telegram.org/bot{token}/sendPhoto'
     body, ct = _build_multipart(
         fields={'chat_id': chat_id, 'caption': caption[:1024], 'parse_mode': 'HTML'},
@@ -668,10 +755,6 @@ def _send_photo_bot(token: str, chat_id: str, caption: str, photo: bytes):
 
 
 def _send_album_bot(token: str, chat_id: str, caption: str, photos: list[bytes]):
-    """
-    Отправляет альбом через Bot API sendMediaGroup.
-    Первая фотография получает caption. Максимум 10 фото.
-    """
     photos = photos[:10]
     url = f'https://api.telegram.org/bot{token}/sendMediaGroup'
     media_json = []
@@ -693,7 +776,6 @@ def _send_album_bot(token: str, chat_id: str, caption: str, photos: list[bytes])
 
 
 def _send_text_bot(token: str, chat_id: str, text: str):
-    """Отправляет текстовое сообщение через Bot API (fallback)."""
     data = json.dumps({
         'chat_id':    chat_id,
         'text':       text[:4096],
@@ -708,17 +790,13 @@ def _send_text_bot(token: str, chat_id: str, text: str):
             if not result.get('ok'):
                 log.error(f'sendMessage не ок: {result.get("description")}')
     except Exception as e:
-        log.error(f'sendMessage error: {e}')
+        log.error(f'sendMessage error: {e}', exc_info=True)
     time.sleep(0.3)
 
 
 # ── Скачивание медиа через Telethon ───────────────────────────────────────────
 
 async def _download_photos(client: TelegramClient, messages: list) -> list[bytes]:
-    """
-    Скачивает все фото/документы-изображения из списка сообщений.
-    Пропускает файлы > 10 МБ и не-изображения.
-    """
     photos = []
     for m in messages:
         media = m.photo or (m.document if _is_image_doc(m) else None)
@@ -731,12 +809,25 @@ async def _download_photos(client: TelegramClient, messages: list) -> list[bytes
         except asyncio.TimeoutError:
             log.warning(f'download_media timeout msg_id={m.id}')
         except Exception as e:
-            log.warning(f'download_media error msg_id={m.id}: {e}')
+            log.warning(f'download_media error msg_id={m.id}: {e}', exc_info=True)
     return photos
 
 
+# БАГ 3 fix: fetch сообщений по (chat_id, msg_id) при одобрении
+async def _fetch_messages_by_refs(client: TelegramClient, refs: list[tuple]) -> list:
+    """Загружает сообщения по списку (chat_id, msg_id) из Telegram."""
+    msgs = []
+    for chat_id, msg_id in refs:
+        try:
+            msg = await client.get_messages(chat_id, ids=msg_id)
+            if msg:
+                msgs.append(msg)
+        except Exception as e:
+            log.warning(f'Не удалось загрузить сообщение {chat_id}/{msg_id}: {e}', exc_info=True)
+    return msgs
+
+
 def _is_image_doc(msg) -> bool:
-    """True если document это изображение (jpeg/png/webp/gif)."""
     doc = getattr(msg, 'document', None)
     if not doc:
         return False
@@ -748,31 +839,21 @@ def _is_image_doc(msg) -> bool:
 
 async def _publish_post(client: TelegramClient, post: dict,
                         dest_chat: str, photos: list[bytes] | None = None):
-    """
-    Публикует пост в канал от имени канала (без «переслано от»).
-
-    Если есть фото — использует Bot API (sendPhoto / sendMediaGroup),
-    так как Telethon.send_file требует upload а не bytes.
-    Если фото нет — отправляет через Telethon send_message (HTML).
-
-    Возвращает True при успехе.
-    """
-    caption  = _build_caption(post)
-    token    = state.get('tg_token', '')
+    caption = _build_caption(post)
+    token   = state.get('tg_token', '')
+    loop    = asyncio.get_event_loop()
 
     try:
         if photos and token:
-            # Bot API: канал видит бота как автора — нормально для публикации
             if len(photos) == 1:
-                await asyncio.get_event_loop().run_in_executor(
+                await loop.run_in_executor(
                     _executor, _send_photo_bot, token, dest_chat, caption, photos[0]
                 )
             else:
-                await asyncio.get_event_loop().run_in_executor(
+                await loop.run_in_executor(
                     _executor, _send_album_bot, token, dest_chat, caption, photos
                 )
         elif photos and not token:
-            # Нет токена — шлём через Telethon, фото как bytes через upload
             await client.send_file(
                 entity=int(dest_chat),
                 file=photos if len(photos) > 1 else photos[0],
@@ -780,7 +861,6 @@ async def _publish_post(client: TelegramClient, post: dict,
                 parse_mode='html',
             )
         else:
-            # Только текст — Telethon
             await client.send_message(
                 entity=int(dest_chat),
                 message=caption,
@@ -789,18 +869,8 @@ async def _publish_post(client: TelegramClient, post: dict,
             )
         return True
     except Exception as e:
-        log.error(f'Ошибка публикации поста: {e}')
+        log.error(f'Ошибка публикации поста: {e}', exc_info=True)
         return False
-
-
-def _get_updates(token: str, offset: int, timeout: int = 30) -> list:
-    # Сокет-таймаут больше polling-таймаута, чтобы не обрывать соединение раньше ответа
-    result = _tg_request(token, 'getUpdates', {
-        'offset':  offset,
-        'timeout': timeout,
-        'allowed_updates': ['callback_query'],
-    }, timeout=timeout + 10)
-    return result.get('result', [])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -831,7 +901,7 @@ async def _resolve_entity(clients: dict, username: str, ss) -> dict | None:
             log.warning(f'[{acc_name}] Недоступен {username}: {e}')
         except Exception as e:
             errors[acc_name] = str(e)
-            log.error(f'[{acc_name}] Ошибка резолва {username}: {e}')
+            log.error(f'[{acc_name}] Ошибка резолва {username}: {e}', exc_info=True)
         await asyncio.sleep(0.5)
 
     msg = (f'🚫 Канал недоступен: @{username}\n'
@@ -840,8 +910,8 @@ async def _resolve_entity(clients: dict, username: str, ss) -> dict | None:
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(_executor, _send_alert,
                                state['tg_token'], state['moderator_chat_id'], msg)
-    await loop.run_in_executor(_executor, _set_channel_status, ss, username, 'недоступен')
-    await loop.run_in_executor(_executor, _write_log, ss, 'ERROR', msg)
+    await _safe_sheets(_set_channel_status, ss, username, 'недоступен')
+    await _safe_sheets(_write_log, ss, 'ERROR', msg)
     return None
 
 
@@ -870,16 +940,17 @@ async def _update_watched_chats(clients: dict, channels: list, ss):
 
     added   = new_ids - state['watched_ids']
     removed = state['watched_ids'] - new_ids
-    state['watched_ids'] = new_ids
-    state['id_to_meta']  = new_id_meta
+
+    # БАГ 6 fix: обновляем state под блокировкой
+    async with _state_lock:
+        state['watched_ids'] = new_ids
+        state['id_to_meta']  = new_id_meta
 
     log.info(f'Каналов в watched_ids: {len(new_ids)} (ключей в id_to_meta: {len(new_id_meta)})')
     if added:   log.info(f'Добавлено ID-ключей: {len(added)}')
     if removed: log.info(f'Убрано ID-ключей: {len(removed)}')
 
-    # Пишем кеш один раз в конце — избегаем 429 от Sheets API
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(_executor, _write_entity_cache, ss)
+    await _safe_sheets(_write_entity_cache, ss)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -891,23 +962,28 @@ async def _settings_reload_loop(clients: dict, ss):
         await asyncio.sleep(SETTINGS_RELOAD_SEC)
         try:
             log.info('Перезагрузка настроек...')
-            loop         = asyncio.get_event_loop()
-            new_settings = await loop.run_in_executor(_executor, _read_settings,      ss)
-            new_rules    = await loop.run_in_executor(_executor, _read_scoring_rules, ss)
-            new_minus    = await loop.run_in_executor(_executor, _read_minus_words,   ss)
-            new_channels = await loop.run_in_executor(_executor, _read_channels,      ss)
+            new_settings = await _safe_sheets_result(_read_settings,      ss)
+            new_rules    = await _safe_sheets_result(_read_scoring_rules, ss)
+            new_minus    = await _safe_sheets_result(_read_minus_words,   ss)
+            new_channels = await _safe_sheets_result(_read_channels,      ss)
 
+            # БАГ 6 fix: обновляем state под блокировкой
             if new_settings:
-                state.update({
-                    'tg_token':             new_settings['tg_token'],
-                    'score_threshold':      new_settings['score_threshold'],
-                    'moderation_threshold': new_settings['moderation_threshold'],
-                    'min_length':           new_settings['min_length'],
-                    'moderator_chat_id':    new_settings['moderator_chat_id'],
-                    'dest_chat_id':         new_settings['dest_chat_id'],
-                })
-            if new_rules    is not None: state['scoring_rules'] = new_rules
-            if new_minus    is not None: state['minus_words']   = new_minus
+                async with _state_lock:
+                    state.update({
+                        'tg_token':             new_settings['tg_token'],
+                        'score_threshold':      new_settings['score_threshold'],
+                        'moderation_threshold': new_settings['moderation_threshold'],
+                        'min_length':           new_settings['min_length'],
+                        'moderator_chat_id':    new_settings['moderator_chat_id'],
+                        'dest_chat_id':         new_settings['dest_chat_id'],
+                    })
+            if new_rules is not None:
+                async with _state_lock:
+                    state['scoring_rules'] = new_rules
+            if new_minus is not None:
+                async with _state_lock:
+                    state['minus_words'] = new_minus
             if new_channels is not None:
                 await _update_watched_chats(clients, new_channels, ss)
 
@@ -919,7 +995,43 @@ async def _settings_reload_loop(clients: dict, ss):
                 f'модерация: {state["moderation_threshold"]}'
             )
         except Exception as e:
-            log.error('Ошибка перезагрузки настроек: ' + str(e))
+            log.error('Ошибка перезагрузки настроек: ' + str(e), exc_info=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Фоновая задача: TTL-cleanup pending_moderation (БАГ 2)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _cleanup_pending_loop():
+    """Раз в час удаляет из pending_moderation записи старше 24ч."""
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            cutoff = time.time() - 86400
+            stale  = [k for k, v in pending_moderation.items()
+                      if v.get('added_at', 0) < cutoff]
+            for k in stale:
+                pending_moderation.pop(k, None)
+            if stale:
+                log.info(f'Cleanup: удалено {len(stale)} устаревших pending-постов')
+        except Exception as e:
+            log.error(f'Ошибка cleanup pending: {e}', exc_info=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Фоновая задача: heartbeat / метрики (БАГ 15)
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _heartbeat_loop():
+    while True:
+        await asyncio.sleep(300)
+        log.info(
+            f'[heartbeat] processed:{metrics["processed"]} '
+            f'published:{metrics["published"]} '
+            f'moderated:{metrics["moderated"]} '
+            f'errors:{metrics["errors"]} '
+            f'pending:{len(pending_moderation)}'
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -927,25 +1039,37 @@ async def _settings_reload_loop(clients: dict, ss):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _bot_polling_loop(clients: dict, ss):
-    """
-    Получает callback_query через getUpdates (long-polling).
-    Обрабатывает нажатия ✅ / ❌ от модератора.
-
-    pending_moderation хранит:
-      ключ  = f'{src_chat_id}:{src_msg_id}'   (из callback_data)
-      value = post dict (с полями src_chat_id, src_msg_id, bot_message_id, ...)
-    """
     offset = 0
     loop   = asyncio.get_event_loop()
 
-    # Выбираем первый доступный клиент для пересылки
     def _first_client() -> TelegramClient | None:
         return next(iter(clients.values()), None)
 
+    # БАГ 8 fix: ждём освобождения слота getUpdates при старте (до 150с)
+    token = state['tg_token']
+    if token:
+        for attempt in range(10):
+            result = await loop.run_in_executor(
+                _executor, _tg_request, token, 'getUpdates',
+                {'offset': 0, 'timeout': 1, 'allowed_updates': ['callback_query']},
+                15,
+            )
+            if result.get('ok'):
+                log.info('[bot_polling] Слот getUpdates свободен — стартуем')
+                break
+            if result.get('error_code') == 409 or 'Conflict' in result.get('description', ''):
+                wait = min(15 * (attempt + 1), 60)
+                log.warning(f'[bot_polling] 409 при старте (попытка {attempt + 1}) — жду {wait}с')
+                await asyncio.sleep(wait)
+            else:
+                break
+
     while True:
-        token     = state['tg_token']
-        moderator = state['moderator_chat_id']
-        dest_chat = state['dest_chat_id']
+        # БАГ 6 fix: читаем копии state под блокировкой
+        async with _state_lock:
+            token     = state['tg_token']
+            moderator = state['moderator_chat_id']
+            dest_chat = state['dest_chat_id']
 
         if not token:
             await asyncio.sleep(5)
@@ -955,14 +1079,25 @@ async def _bot_polling_loop(clients: dict, ss):
             updates = await loop.run_in_executor(
                 _executor, _get_updates, token, offset, 30
             )
-        except Exception as e:
+        except RuntimeError as e:
             err_str = str(e)
-            if '409' in err_str:
-                log.warning('[bot_polling] 409 Conflict — другой инстанс ещё жив, жду 15с...')
+            if err_str.startswith('409:'):
+                log.warning(f'[bot_polling] 409 Conflict в цикле — жду 15с + deleteWebhook')
                 await asyncio.sleep(15)
+                await loop.run_in_executor(
+                    _executor, _tg_request,
+                    token, 'deleteWebhook', {'drop_pending_updates': False}
+                )
+            elif err_str.startswith('401:') or err_str.startswith('403:'):
+                log.critical(f'[bot_polling] Неверный токен бота ({err_str}) — останавливаемся')
+                return
             else:
-                log.error(f'[bot_polling] getUpdates error: {e}')
+                log.error(f'[bot_polling] getUpdates RuntimeError: {e}', exc_info=True)
                 await asyncio.sleep(5)
+            continue
+        except Exception as e:
+            log.error(f'[bot_polling] getUpdates error: {e}', exc_info=True)
+            await asyncio.sleep(5)
             continue
 
         for upd in updates:
@@ -976,7 +1111,8 @@ async def _bot_polling_loop(clients: dict, ss):
             from_id = cq.get('from', {}).get('id', '')
             msg_id  = cq.get('message', {}).get('message_id', 0)
 
-            # Парсим callback_data: 'approve:SRC_CHAT_ID:SRC_MSG_ID'
+            # БАГ 13 fix: callback_data может содержать отрицательный src_chat_id
+            # "approve:-1001234567:999" → split(':', 2) → ['approve', '-1001234567', '999'] ✓
             parts = data.split(':', 2)
             if len(parts) != 3 or parts[0] not in ('approve', 'skip'):
                 await loop.run_in_executor(
@@ -993,7 +1129,6 @@ async def _bot_polling_loop(clients: dict, ss):
                     _executor, _answer_callback, token, cq_id,
                     '⚠️ Пост уже обработан или не найден в памяти'
                 )
-                # Убираем кнопки у устаревшей карточки
                 await loop.run_in_executor(
                     _executor, _edit_message_reply_markup,
                     token, moderator, msg_id, '⚠️ Пост не найден в очереди'
@@ -1001,7 +1136,6 @@ async def _bot_polling_loop(clients: dict, ss):
                 continue
 
             if action == 'approve':
-                # ── Публикуем через Telethon (от имени канала) ────────────
                 client = _first_client()
                 if client and dest_chat:
                     try:
@@ -1019,19 +1153,19 @@ async def _bot_polling_loop(clients: dict, ss):
                             pending_moderation.pop(pend_key, None)
                             continue
 
-                        # Скачиваем фото (они были сохранены при поступлении)
-                        grouped_msgs = post.get('grouped_msgs', [])
+                        # БАГ 3 fix: загружаем сообщения по refs, а не из памяти
+                        refs = post.get('grouped_refs', [])
+                        grouped_msgs = await _fetch_messages_by_refs(client, refs) if refs else []
                         photos = await _download_photos(client, grouped_msgs) if grouped_msgs else []
 
                         ok = await _publish_post(client, post, dest_chat, photos or None)
                         if ok:
                             published_fingerprints.append(fp)
+                            metrics['published'] += 1
                             log.info(f'[модерация ✅ одобрено фото:{len(photos)}] {post["chat_name"]} → {post["link"]}')
-                            await loop.run_in_executor(_executor, _write_post, ss, post)
-                            await loop.run_in_executor(
-                                _executor, _update_rejected_status,
-                                ss, post.get('bot_message_id', 0), 'одобрено'
-                            )
+                            await _safe_sheets_retry(_write_post, ss, post)
+                            await _safe_sheets(_update_rejected_status, ss,
+                                               post.get('bot_message_id', 0), 'одобрено')
                             await loop.run_in_executor(
                                 _executor, _answer_callback, token, cq_id, '✅ Опубликовано!'
                             )
@@ -1041,12 +1175,14 @@ async def _bot_polling_loop(clients: dict, ss):
                                 f'✅ Опубликовано модератором {from_id}'
                             )
                         else:
+                            metrics['errors'] += 1
                             await loop.run_in_executor(
                                 _executor, _answer_callback, token, cq_id,
                                 '❌ Ошибка публикации — смотрите логи'
                             )
                     except Exception as e:
-                        log.error(f'[модерация] Ошибка публикации одобренного: {e}')
+                        metrics['errors'] += 1
+                        log.error(f'[модерация] Ошибка публикации одобренного: {e}', exc_info=True)
                         await loop.run_in_executor(
                             _executor, _answer_callback, token, cq_id, f'❌ Ошибка: {e}'
                         )
@@ -1058,10 +1194,8 @@ async def _bot_polling_loop(clients: dict, ss):
 
             elif action == 'skip':
                 log.info(f'[модерация ❌ пропущено] {post["chat_name"]} → {post["link"]}')
-                await loop.run_in_executor(
-                    _executor, _update_rejected_status,
-                    ss, post.get('bot_message_id', 0), 'пропущено'
-                )
+                await _safe_sheets(_update_rejected_status, ss,
+                                   post.get('bot_message_id', 0), 'пропущено')
                 await loop.run_in_executor(
                     _executor, _answer_callback, token, cq_id, '❌ Пост пропущен'
                 )
@@ -1071,10 +1205,9 @@ async def _bot_polling_loop(clients: dict, ss):
                     f'❌ Пропущено модератором {from_id}'
                 )
 
-            # Удаляем из очереди после обработки
             pending_moderation.pop(pend_key, None)
 
-        await asyncio.sleep(0)  # отдаём управление event-loop'у
+        await asyncio.sleep(0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1082,7 +1215,12 @@ async def _bot_polling_loop(clients: dict, ss):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def main():
+    global _sheets_lock, _state_lock
     log.info('═══ TG Parser v3 стартует ═══')
+
+    # Инициализируем asyncio.Lock-и здесь, внутри event-loop
+    _sheets_lock = asyncio.Lock()
+    _state_lock  = asyncio.Lock()
 
     loop = asyncio.get_event_loop()
 
@@ -1091,13 +1229,13 @@ async def main():
         ss = await loop.run_in_executor(_executor, _get_spreadsheet)
         log.info('Google Sheets: подключён')
     except Exception as e:
-        log.error('Google Sheets: ошибка подключения: ' + str(e))
+        log.error('Google Sheets: ошибка подключения: ' + str(e), exc_info=True)
         return
 
-    settings = await loop.run_in_executor(_executor, _read_settings,      ss)
-    rules    = await loop.run_in_executor(_executor, _read_scoring_rules, ss)
-    minus    = await loop.run_in_executor(_executor, _read_minus_words,   ss)
-    channels = await loop.run_in_executor(_executor, _read_channels,      ss)
+    settings = await _safe_sheets_result(_read_settings,      ss)
+    rules    = await _safe_sheets_result(_read_scoring_rules, ss)
+    minus    = await _safe_sheets_result(_read_minus_words,   ss)
+    channels = await _safe_sheets_result(_read_channels,      ss)
 
     if not settings:
         log.error('Не удалось прочитать настройки — проверьте лист «Настройки»')
@@ -1120,7 +1258,7 @@ async def main():
         f'правил скоринга: {len(rules)} | минус-слов: {len(minus)}'
     )
 
-    # ── Сбрасываем webhook — иначе getUpdates вернёт 409 ──────────────────
+    # ── Сбрасываем webhook ─────────────────────────────────────────────────
     if state['tg_token']:
         await loop.run_in_executor(
             _executor, _tg_request,
@@ -1152,9 +1290,7 @@ async def main():
         return
 
     # ── Резолв каналов ─────────────────────────────────────────────────────
-    # Сначала загружаем кеш entity_id из таблицы — чтобы не делать get_entity
-    # для уже известных каналов при каждом рестарте.
-    cached_meta = await loop.run_in_executor(_executor, _read_entity_cache, ss)
+    cached_meta = await _safe_sheets_result(_read_entity_cache, ss)
     state['username_to_meta'].update(cached_meta)
 
     if not channels:
@@ -1170,116 +1306,155 @@ async def main():
     )
 
     # ══════════════════════════════════════════════════════════════════════
-    # Хендлер новых сообщений — регистрируем для каждого клиента здесь,
-    # в main(), чтобы всё было в одном месте.
-    # Пересылка идёт через Telethon (тот же client), бот — только для карточек.
+    # Хендлер новых сообщений
     # ══════════════════════════════════════════════════════════════════════
 
     # ── Буфер для сборки альбомов ──────────────────────────────────────────
-    # grouped_id → {'msgs': [...], 'timer': asyncio.TimerHandle, 'client': ..., 'acc': str}
     album_buffer: dict = {}
 
+    # БАГ 14 fix: graceful shutdown — flush всех незавершённых альбомов
+    async def _graceful_shutdown():
+        log.info(f'SIGTERM — завершаем {len(album_buffer)} альбомов из буфера')
+        flush_tasks = []
+        for gid, entry in list(album_buffer.items()):
+            # Отменяем старый таймер
+            handle = entry.get('timer')
+            if handle:
+                handle.cancel()
+            flush_tasks.append(
+                asyncio.ensure_future(
+                    _flush_album(gid, entry['acc'], entry['client'])
+                )
+            )
+        if flush_tasks:
+            await asyncio.gather(*flush_tasks, return_exceptions=True)
+        log.info('Graceful shutdown завершён')
+
+    loop.add_signal_handler(
+        signal.SIGTERM,
+        lambda: asyncio.ensure_future(_graceful_shutdown())
+    )
+
     async def _flush_album(grouped_id: int, _acc: str, _client: TelegramClient):
-        """Вызывается через 1.5с после первого сообщения группы — обрабатывает альбом."""
+        # БАГ 1 fix: pop ДО try — буфер очищается даже при исключении
         entry = album_buffer.pop(grouped_id, None)
         if not entry:
             return
-        msgs = sorted(entry['msgs'], key=lambda m: m.id)
-        first = msgs[0]
-
-        raw_id = first.peer_id.channel_id if hasattr(first.peer_id, 'channel_id') else first.chat_id
-        # Нормализуем: событие могло прийти с разными форматами
-        try:
-            raw_id = first.chat_id
-        except Exception:
-            pass
-        abs_id = abs(raw_id)
-
-        meta = state['id_to_meta'].get(abs_id)
-        if meta is None:
-            s = str(abs_id)
-            alt = int(s[3:]) if s.startswith('100') and len(s) > 12 else int('100' + s)
-            meta = state['id_to_meta'].get(alt)
-        if meta is None:
-            return
-
-         # Берём текст из первого сообщения с непустым текстом
-        text = ''
-        text_entities = None
-        for m in msgs:
-            t = m.text or m.message or ''
-            if hasattr(m, 'caption') and m.caption:
-                t = m.caption
-            if t.strip():
-                text = t
-                text_entities = m.entities
-                break
-        html_text = _text_to_html(text, text_entities)
-
-        if _has_minus_word(text, state['minus_words']):
-            return
-        if len(text) < state['min_length']:
-            return
-
-        score = _calc_score(text, state['scoring_rules'])
-        if score < state['moderation_threshold']:
-            return
 
         try:
-            chat = await _client.get_entity(raw_id)
-        except Exception:
-            chat = None
+            msgs  = sorted(entry['msgs'], key=lambda m: m.id)
+            first = msgs[0]
 
-        link      = _build_link(chat, first.id) if chat else f'https://t.me/c/{abs_id}/{first.id}'
-        chat_name = meta.get('chat_name', str(abs_id))
-        author_name, author_link = _get_author_info(first)
+            # БАГ 9 fix: один надёжный источник raw_id
+            try:
+                raw_id = first.chat_id
+            except Exception:
+                raw_id = -(getattr(first.peer_id, 'channel_id', 0))
 
-        post = {
-            'date':        first.date.replace(tzinfo=None),
-            'chat_name':   chat_name,
-            'author_name': author_name,
-            'author_link': author_link,
-            'link':        link,
-            'text':        text,
-            'html_text':   html_text,
-            'score':       score,
-            'account':     _acc,
-            'src_chat_id': raw_id,
-            'src_msg_id':  first.id,
-        }
+            abs_id = abs(raw_id)
 
-        tg_token  = state['tg_token']
-        threshold = state['score_threshold']
-        dest_chat = state['dest_chat_id']
-        moderator = state['moderator_chat_id']
+            # БАГ 6 fix: читаем копии state под блокировкой
+            async with _state_lock:
+                id_to_meta    = dict(state['id_to_meta'])
+                minus_words   = list(state['minus_words'])
+                scoring_rules = list(state['scoring_rules'])
+                min_length    = state['min_length']
+                mod_threshold = state['moderation_threshold']
+                threshold     = state['score_threshold']
+                tg_token      = state['tg_token']
+                dest_chat     = state['dest_chat_id']
+                moderator     = state['moderator_chat_id']
 
-        if score >= threshold:
-            fp = _post_fingerprint(text, author_name)
-            if fp in published_fingerprints:
-                log.info(f'[{_acc}][дубль альбом ⛔] {chat_name}')
+            meta = id_to_meta.get(abs_id)
+            if meta is None:
+                s   = str(abs_id)
+                alt = int(s[3:]) if s.startswith('100') and len(s) > 12 else int('100' + s)
+                meta = id_to_meta.get(alt)
+            if meta is None:
                 return
-            published_fingerprints.append(fp)
 
-            photos = await _download_photos(_client, msgs)
-            await loop.run_in_executor(_executor, _write_post, ss, post)
-            log.info(f'[авто альбом ✅ скор:{score} фото:{len(photos)} {_acc}] {chat_name} → {link}')
-            if dest_chat:
-                ok = await _publish_post(_client, post, dest_chat, photos)
-                if not ok:
-                    log.error(f'[{_acc}] Публикация альбома не удалась: {link}')
-        else:
-            log.info(f'[модерация альбом ⏳ скор:{score}/{threshold} {_acc}] {chat_name} → {link}')
-            post['photos_count'] = len(msgs)  # фото скачаем только при одобрении
-            bot_msg_id = 0
-            if tg_token and moderator:
-                bot_msg_id = await loop.run_in_executor(
-                    _executor, _send_moderation_card, post, tg_token, moderator,
-                )
-            post['bot_message_id'] = bot_msg_id
-            post['grouped_msgs']   = msgs  # сохраняем для скачивания при одобрении
-            pend_key = f'{raw_id}:{first.id}'
-            pending_moderation[pend_key] = post
-            await loop.run_in_executor(_executor, _write_rejected, ss, post, bot_msg_id)
+            text = ''
+            text_entities = None
+            for m in msgs:
+                t = m.text or m.message or ''
+                if hasattr(m, 'caption') and m.caption:
+                    t = m.caption
+                if t.strip():
+                    text = t
+                    text_entities = m.entities
+                    break
+            html_text = _text_to_html(text, text_entities)
+
+            if _has_minus_word(text, minus_words):
+                return
+            if len(text) < min_length:
+                return
+
+            score = _calc_score(text, scoring_rules)
+            if score < mod_threshold:
+                return
+
+            try:
+                chat = await _client.get_entity(raw_id)
+            except Exception:
+                chat = None
+
+            link      = _build_link(chat, first.id) if chat else f'https://t.me/c/{abs_id}/{first.id}'
+            chat_name = meta.get('chat_name', str(abs_id))
+            author_name, author_link = _get_author_info(first)
+
+            post = {
+                'date':        first.date.replace(tzinfo=None),
+                'chat_name':   chat_name,
+                'author_name': author_name,
+                'author_link': author_link,
+                'link':        link,
+                'text':        text,
+                'html_text':   html_text,
+                'score':       score,
+                'account':     _acc,
+                'src_chat_id': raw_id,
+                'src_msg_id':  first.id,
+                'added_at':    time.time(),  # БАГ 2: для TTL-cleanup
+            }
+
+            metrics['processed'] += 1
+
+            if score >= threshold:
+                # БАГ 5 fix: добавляем fp ДО первого await
+                fp = _post_fingerprint(text, author_name)
+                if fp in published_fingerprints:
+                    log.info(f'[{_acc}][дубль альбом ⛔] {chat_name}')
+                    return
+                published_fingerprints.append(fp)
+
+                photos = await _download_photos(_client, msgs)
+                await _safe_sheets_retry(_write_post, ss, post)
+                metrics['published'] += 1
+                log.info(f'[авто альбом ✅ скор:{score} фото:{len(photos)} {_acc}] {chat_name} → {link}')
+                if dest_chat:
+                    ok = await _publish_post(_client, post, dest_chat, photos)
+                    if not ok:
+                        metrics['errors'] += 1
+                        log.error(f'[{_acc}] Публикация альбома не удалась: {link}')
+            else:
+                log.info(f'[модерация альбом ⏳ скор:{score}/{threshold} {_acc}] {chat_name} → {link}')
+                # БАГ 3 fix: сохраняем refs вместо живых объектов
+                post['grouped_refs'] = [(m.chat_id, m.id) for m in msgs]
+                bot_msg_id = 0
+                if tg_token and moderator:
+                    bot_msg_id = await loop.run_in_executor(
+                        _executor, _send_moderation_card, post, tg_token, moderator,
+                    )
+                post['bot_message_id'] = bot_msg_id
+                pend_key = f'{raw_id}:{first.id}'
+                pending_moderation[pend_key] = post
+                metrics['moderated'] += 1
+                await _safe_sheets_retry(_write_rejected, ss, post, bot_msg_id)
+
+        except Exception as e:
+            metrics['errors'] += 1
+            log.error(f'_flush_album error grouped_id={grouped_id}: {e}', exc_info=True)
 
     for acc_label, client in clients.items():
 
@@ -1289,11 +1464,23 @@ async def main():
                 raw_id = event.chat_id
                 abs_id = abs(raw_id)
 
-                meta = state['id_to_meta'].get(abs_id)
+                # БАГ 6 fix: читаем копии state под блокировкой
+                async with _state_lock:
+                    id_to_meta    = dict(state['id_to_meta'])
+                    minus_words   = list(state['minus_words'])
+                    scoring_rules = list(state['scoring_rules'])
+                    min_length    = state['min_length']
+                    mod_threshold = state['moderation_threshold']
+                    threshold     = state['score_threshold']
+                    tg_token      = state['tg_token']
+                    dest_chat     = state['dest_chat_id']
+                    moderator     = state['moderator_chat_id']
+
+                meta = id_to_meta.get(abs_id)
                 if meta is None:
-                    s = str(abs_id)
+                    s   = str(abs_id)
                     alt = int(s[3:]) if s.startswith('100') and len(s) > 12 else int('100' + s)
-                    meta = state['id_to_meta'].get(alt)
+                    meta = id_to_meta.get(alt)
 
                 if meta is None:
                     log.debug(f'[{_acc}] Пропущен chat_id={raw_id} — не в списке')
@@ -1303,8 +1490,8 @@ async def main():
                 if msg.action is not None:
                     return
 
-                # ── Дедупликация входящих ──────────────────────────────────
-                dedup_key = (abs_id, msg.id)
+                # БАГ 10 fix: дедупликация по raw_id (со знаком), не abs_id
+                dedup_key = (raw_id, msg.id)
                 if dedup_key in seen_ids:
                     return
                 seen_ids.append(dedup_key)
@@ -1313,7 +1500,6 @@ async def main():
                 grouped_id = getattr(msg, 'grouped_id', None)
                 if grouped_id:
                     if grouped_id not in album_buffer:
-                        # Запускаем таймер — через 1.5с обрабатываем всю группу
                         handle = loop.call_later(
                             1.5, lambda gid=grouped_id: asyncio.ensure_future(
                                 _flush_album(gid, _acc, _client)
@@ -1324,26 +1510,24 @@ async def main():
                             'acc': _acc, 'client': _client,
                         }
                     album_buffer[grouped_id]['msgs'].append(msg)
-                    return  # одиночную обработку не делаем — ждём таймер
+                    return
 
                 # ── Одиночное сообщение ────────────────────────────────────
-                # Текст — без flatten, сохраняем оригинальное форматирование
                 text = msg.text or msg.message or ''
                 if hasattr(msg, 'caption') and msg.caption:
                     text = msg.caption
                 text = re.sub(r'[^\S\n]+', ' ', text).strip()
                 html_text = _text_to_html(text, msg.entities)
 
-                if _has_minus_word(text, state['minus_words']):
+                if _has_minus_word(text, minus_words):
                     log.debug(f'[{_acc}][минус-слово] {meta["chat_name"]} — выброс')
                     return
 
-                if len(text) < state['min_length']:
+                if len(text) < min_length:
                     log.debug(f'[{_acc}][короткий] {meta["chat_name"]} ({len(text)}) — выброс')
                     return
 
-                score = _calc_score(text, state['scoring_rules'])
-                mod_threshold = state['moderation_threshold']
+                score = _calc_score(text, scoring_rules)
                 if score < mod_threshold:
                     log.debug(f'[{_acc}][скор:{score}<{mod_threshold}] {meta["chat_name"]} — выброс')
                     return
@@ -1365,28 +1549,27 @@ async def main():
                     'account':     _acc,
                     'src_chat_id': raw_id,
                     'src_msg_id':  msg.id,
+                    'added_at':    time.time(),  # БАГ 2: для TTL-cleanup
                 }
 
-                tg_token  = state['tg_token']
-                threshold = state['score_threshold']
-                dest_chat = state['dest_chat_id']
-                moderator = state['moderator_chat_id']
+                metrics['processed'] += 1
 
                 if score >= threshold:
+                    # БАГ 5 fix: добавляем fp ДО первого await
                     fp = _post_fingerprint(text, author_name)
                     if fp in published_fingerprints:
                         log.info(f'[{_acc}][дубль ⛔] {chat_name}')
                         return
                     published_fingerprints.append(fp)
 
-                    # Скачиваем фото если есть
                     photos = await _download_photos(_client, [msg])
-
-                    await loop.run_in_executor(_executor, _write_post, ss, post)
+                    await _safe_sheets_retry(_write_post, ss, post)
+                    metrics['published'] += 1
                     log.info(f'[авто ✅ скор:{score} фото:{len(photos)} {_acc}] {chat_name} → {link}')
                     if dest_chat:
                         ok = await _publish_post(_client, post, dest_chat, photos)
                         if not ok:
+                            metrics['errors'] += 1
                             log.error(f'[{_acc}] Публикация не удалась: {link}')
                 else:
                     log.info(f'[модерация ⏳ скор:{score}/{threshold} {_acc}] {chat_name} → {link}')
@@ -1396,18 +1579,21 @@ async def main():
                             _executor, _send_moderation_card, post, tg_token, moderator,
                         )
                     post['bot_message_id'] = bot_msg_id
-                    post['grouped_msgs']   = [msg]  # для скачивания при одобрении
+                    # БАГ 3 fix: сохраняем refs вместо живых объектов
+                    post['grouped_refs'] = [(msg.chat_id, msg.id)]
                     pend_key = f'{raw_id}:{msg.id}'
                     pending_moderation[pend_key] = post
-                    await loop.run_in_executor(_executor, _write_rejected, ss, post, bot_msg_id)
+                    metrics['moderated'] += 1
+                    await _safe_sheets_retry(_write_rejected, ss, post, bot_msg_id)
 
             except Exception as e:
+                metrics['errors'] += 1
                 log.error(f'[{_acc}] Ошибка обработки сообщения: {e}', exc_info=True)
 
         log.info(f'[{acc_label}] Хендлер зарегистрирован')
 
     # ── Запись в лог таблицы ───────────────────────────────────────────────
-    await loop.run_in_executor(_executor, _write_log, ss, 'INFO',
+    await _safe_sheets(_write_log, ss, 'INFO',
         f'Запущен | аккаунтов: {len(clients)} | '
         f'каналов: {len(state["username_to_meta"])} | '
         f'правил: {len(state["scoring_rules"])} | '
@@ -1418,13 +1604,17 @@ async def main():
     # ── Фоновые задачи ─────────────────────────────────────────────────────
     asyncio.create_task(_settings_reload_loop(clients, ss))
     asyncio.create_task(_bot_polling_loop(clients, ss))
+    asyncio.create_task(_cleanup_pending_loop())   # БАГ 2
+    asyncio.create_task(_heartbeat_loop())          # БАГ 15
+
     log.info(
         f'Слушаю события. '
         f'Настройки обновляются каждые {SETTINGS_RELOAD_SEC}с. '
-        f'Bot polling запущен.'
+        f'Bot polling запущен. '
+        f'Cleanup pending: каждый час. '
+        f'Heartbeat: каждые 5 мин.'
     )
 
-    # ── Держим всех клиентов живыми ────────────────────────────────────────
     await asyncio.gather(*[c.run_until_disconnected() for c in clients.values()])
 
 
