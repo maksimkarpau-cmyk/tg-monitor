@@ -239,6 +239,54 @@ def _write_log(ss, level, message, account=''):
         log.error('Ошибка записи лога: ' + str(e))
 
 
+def _read_entity_cache(ss) -> dict:
+    """Читает лист «Кеш» → {username: {entity_id, chat_name, username}}"""
+    try:
+        try:
+            ws = ss.worksheet('Кеш')
+        except Exception:
+            ws = ss.add_worksheet('Кеш', 1000, 3)
+            ws.append_row(['username', 'entity_id', 'chat_name'])
+            return {}
+        result = {}
+        for row in ws.get_all_values()[1:]:
+            if len(row) >= 2 and row[0].strip() and row[1].strip():
+                try:
+                    result[row[0].strip()] = {
+                        'entity_id': int(float(row[1].strip())),
+                        'chat_name': row[2].strip() if len(row) > 2 else '',
+                        'username':  row[0].strip(),
+                    }
+                except ValueError:
+                    pass
+        log.info(f'Кеш загружен: {len(result)} каналов')
+        return result
+    except Exception as e:
+        log.error(f'Ошибка чтения кеша: {e}')
+        return {}
+
+
+def _write_entity_cache(ss):
+    """Записывает state['username_to_meta'] в лист «Кеш»."""
+    try:
+        try:
+            ws = ss.worksheet('Кеш')
+        except Exception:
+            ws = ss.add_worksheet('Кеш', 1000, 3)
+        rows = [['username', 'entity_id', 'chat_name']]
+        for uname, meta in state['username_to_meta'].items():
+            rows.append([
+                uname,
+                str(meta.get('entity_id', '')),
+                meta.get('chat_name', ''),
+            ])
+        ws.clear()
+        ws.update(rows, value_input_option='USER_ENTERED')
+        log.info(f'Кеш записан: {len(rows) - 1} каналов')
+    except Exception as e:
+        log.error(f'Ошибка записи кеша: {e}')
+
+
 def _set_channel_status(ss, username: str, status: str):
     try:
         ws = ss.worksheet('Каналы')
@@ -747,6 +795,9 @@ async def _update_watched_chats(clients: dict, channels: list, ss):
                 new_ids.add(vid)
                 new_id_meta[vid] = meta
             state['username_to_meta'][username] = meta
+            # Сохраняем кеш сразу после нового резолва — чтобы не терять при рестарте
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(_executor, _write_entity_cache, ss)
         await asyncio.sleep(0.8)
 
     added   = new_ids - state['watched_ids']
@@ -1012,10 +1063,16 @@ async def main():
         return
 
     # ── Резолв каналов ─────────────────────────────────────────────────────
+    # Сначала загружаем кеш entity_id из таблицы — чтобы не делать get_entity
+    # для уже известных каналов при каждом рестарте.
+    cached_meta = await loop.run_in_executor(_executor, _read_entity_cache, ss)
+    state['username_to_meta'].update(cached_meta)
+
     if not channels:
         log.warning('Лист «Каналы» пуст — добавьте каналы')
     else:
-        log.info(f'Резолвим {len(channels)} каналов...')
+        known = sum(1 for ch in channels if _extract_username(ch['username']) in cached_meta)
+        log.info(f'Каналов: {len(channels)} | из кеша: {known} | новых (нужен резолв): {len(channels) - known}')
 
     await _update_watched_chats(clients, channels or [], ss)
     log.info(
