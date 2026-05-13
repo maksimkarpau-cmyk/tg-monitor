@@ -376,9 +376,12 @@ def _get_author_info(msg):
         return '', ''
 
 def _text_to_html(text: str, entities) -> str:
-    """Конвертирует Telegram message entities в HTML-теги."""
-    if not entities or not text:
-        return text or ''
+    if not text:
+        return ''
+    # Экранируем HTML-спецсимволы в plain-тексте
+    escaped = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    if not entities:
+        return escaped
 
     from telethon.tl.types import (
         MessageEntityBold, MessageEntityItalic, MessageEntityUnderline,
@@ -386,16 +389,15 @@ def _text_to_html(text: str, entities) -> str:
         MessageEntityTextUrl, MessageEntityUrl, MessageEntityMention,
     )
 
-    # Работаем с байтами чтобы правильно считать offsets (Telegram даёт UTF-16 offsets)
-    encoded = text.encode('utf-16-le')
-
-    # Собираем теги: {pos: [open_tags], pos: [close_tags]}
-    opens = {}
+    # Telegram offsets — в UTF-16 code units
+    chars = list(text)  # список символов Unicode
+    # Строим массив меток: на каждую позицию символа — какие теги открыть/закрыть
+    opens  = {}
     closes = {}
 
     for ent in sorted(entities, key=lambda e: (e.offset, -e.length)):
-        o = ent.offset * 2  # utf-16-le: каждый символ = 2 байта
-        c = (ent.offset + ent.length) * 2
+        o = ent.offset
+        c = ent.offset + ent.length
 
         if isinstance(ent, MessageEntityBold):
             tag_o, tag_c = '<b>', '</b>'
@@ -413,40 +415,32 @@ def _text_to_html(text: str, entities) -> str:
             url = ent.url.replace('"', '&quot;')
             tag_o, tag_c = f'<a href="{url}">', '</a>'
         elif isinstance(ent, MessageEntityUrl):
-            raw_url = encoded[o:c].decode('utf-16-le')
-            url = raw_url.replace('"', '&quot;')
-            tag_o, tag_c = f'<a href="{url}">', '</a>'
+            raw_url = ''.join(chars[o:c]).replace('"', '&quot;')
+            tag_o, tag_c = f'<a href="{raw_url}">', '</a>'
         elif isinstance(ent, MessageEntityMention):
-            mention = encoded[o:c].decode('utf-16-le')
-            username = mention.lstrip('@')
-            tag_o, tag_c = f'<a href="https://t.me/{username}">', '</a>'
+            mention = ''.join(chars[o:c]).lstrip('@')
+            tag_o, tag_c = f'<a href="https://t.me/{mention}">', '</a>'
         else:
             continue
 
         opens.setdefault(o, []).append(tag_o)
         closes.setdefault(c, []).insert(0, tag_c)
 
-    # Собираем результат посимвольно
+    # Собираем результат
     result = []
-    i = 0
-    while i <= len(encoded) - 1 or i in opens or i in closes:
+    escaped_chars = list(escaped)  # уже экранированные символы (1:1 с chars по индексу)
+    for i in range(len(chars)):
         for tag in closes.get(i, []):
             result.append(tag)
         for tag in opens.get(i, []):
             result.append(tag)
-        if i < len(encoded) - 1:
-            char = encoded[i:i+2].decode('utf-16-le')
-            # Экранируем HTML-спецсимволы в обычном тексте
-            char = char.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            result.append(char)
-        i += 2
-
-    # Закрывающие теги в самом конце
-    for tag in closes.get(len(encoded), []):
+        result.append(escaped_chars[i])
+    # Закрывающие теги после последнего символа
+    for tag in closes.get(len(chars), []):
         result.append(tag)
 
     return ''.join(result)
-
+  
 # ══════════════════════════════════════════════════════════════════════════════
 # Фильтрация и скоринг
 # ══════════════════════════════════════════════════════════════════════════════
