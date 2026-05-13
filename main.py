@@ -1,32 +1,5 @@
 """
 TG Parser v3 — один аккаунт (или два), скоринг + модерация через inline-кнопки.
-
-Ключевые решения:
-- Пересылка в dest-канал идёт через Telethon-аккаунт (не Bot API),
-  поэтому бот НЕ обязан состоять в каналах-источниках.
-- Бот используется только для: карточек модерации (sendMessage + inline-кнопки)
-  и приёма callback_query от кнопок ✅/❌.
-- Весь основной поток (main + хендлер) — в одном месте.
-
-Исправленные баги (см. баги.txt):
-  1.  album_buffer не защищён от исключений — pop до try, except логирует traceback.
-  2.  pending_moderation утекает — TTL-cleanup раз в час, записи старше 24ч удаляются.
-  3.  grouped_msgs хранит живые Telethon-объекты — заменено на (chat_id, msg_id) refs,
-      fetch при одобрении.
-  4.  gspread не thread-safe — asyncio.Lock (_sheets_lock) вокруг каждого Sheets-вызова.
-  5.  published_fingerprints: check+append не атомарны — fp добавляется ДО первого await.
-  6.  state.update без блокировки — asyncio.Lock (_state_lock) при записи и чтении копии.
-  7.  Нет retry при Sheets 429/500 — _write_with_retry с exponential backoff.
-  8.  _get_updates не различает error_code — поднимает RuntimeError('409:...') при Conflict;
-      _bot_polling_loop при старте ждёт освобождения слота, в цикле — backoff + повтор deleteWebhook.
-  9.  raw_id в _flush_album получается ненадёжно — один источник first.chat_id с fallback.
-  10. seen_ids дедуплицирует по abs_id — исправлено на raw_id (с сохранением знака).
-  11. _all_id_variants ломается на коротких channel_id — граничные условия защищены.
-  12. _text_to_html смещения в UTF-16, а chars — Unicode — добавлена конвертация.
-  13. Логирование без traceback во многих except — везде добавлен exc_info=True.
-  14. Нет graceful shutdown — SIGTERM дожидается flush всех album_buffer.
-  15. Метрики / heartbeat — счётчики + _heartbeat_loop каждые 5 мин.
-  16. ThreadPoolExecutor расширен до 8 воркеров (опционально из env).
 """
 import asyncio
 import base64
@@ -35,10 +8,8 @@ import json
 import logging
 import os
 import re
-import signal
 import time
 import urllib.request
-import urllib.parse
 import unicodedata
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -54,6 +25,7 @@ from telethon.errors import (
     UsernameNotOccupiedError,
 )
 from telethon.sessions import StringSession
+from telethon.tl.types import MessageService, MessageEmpty
 
 # ── Конфиг из переменных окружения ────────────────────────────────────────────
 
@@ -97,28 +69,19 @@ state = {
 
 TZ_OFFSET_HOURS = 3
 
-# БАГ 10 fix: храним raw_id (со знаком), не abs_id
 seen_ids: deque = deque(maxlen=2000)
-
 published_fingerprints: deque = deque(maxlen=500)
-
-# БАГ 2 fix: значение хранит 'added_at' для TTL-cleanup
 pending_moderation: dict = {}
 
 _executor = ThreadPoolExecutor(max_workers=EXECUTOR_WORKERS)
+_sheets_lock: asyncio.Lock | None = None
+_state_lock:  asyncio.Lock | None = None
 
-# БАГ 4 fix: asyncio.Lock для gspread (не thread-safe)
-_sheets_lock: asyncio.Lock | None = None   # инициализируется в main()
-
-# БАГ 6 fix: asyncio.Lock для чтения/записи state
-_state_lock: asyncio.Lock | None = None    # инициализируется в main()
-
-# БАГ 15 fix: счётчики метрик
 metrics = {'processed': 0, 'published': 0, 'moderated': 0, 'errors': 0}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Google Sheets — подключение
+# Google Sheets
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _get_spreadsheet():
@@ -132,12 +95,7 @@ def _get_spreadsheet():
     return gc.open_by_key(SPREADSHEET_ID)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Google Sheets — retry-обёртка (БАГ 7)
-# ══════════════════════════════════════════════════════════════════════════════
-
 def _write_with_retry(fn, *args, max_attempts: int = 3):
-    """Вызывает fn(*args) с exponential backoff при 429/500 от Sheets API."""
     for attempt in range(max_attempts):
         try:
             fn(*args)
@@ -154,37 +112,28 @@ def _write_with_retry(fn, *args, max_attempts: int = 3):
         except Exception as e:
             log.error(f'Sheets write failed: {e}', exc_info=True)
             return
-    log.error(f'Sheets write окончательно не удалась после {max_attempts} попыток')
+    log.error(f'Sheets write не удалась после {max_attempts} попыток')
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Google Sheets — безопасные async-обёртки (БАГ 4)
-# ══════════════════════════════════════════════════════════════════════════════
 
 async def _safe_sheets(fn, *args):
-    """Выполняет fn(*args) в executor под _sheets_lock."""
     loop = asyncio.get_event_loop()
     async with _sheets_lock:
         await loop.run_in_executor(_executor, fn, *args)
 
 
 async def _safe_sheets_retry(fn, *args):
-    """Выполняет fn(*args) через _write_with_retry под _sheets_lock."""
     loop = asyncio.get_event_loop()
     async with _sheets_lock:
         await loop.run_in_executor(_executor, _write_with_retry, fn, *args)
 
 
 async def _safe_sheets_result(fn, *args):
-    """Выполняет fn(*args) в executor под _sheets_lock, возвращает результат."""
     loop = asyncio.get_event_loop()
     async with _sheets_lock:
         return await loop.run_in_executor(_executor, fn, *args)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Google Sheets — чтение
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Чтение ─────────────────────────────────────────────────────────────────────
 
 def _read_settings(ss):
     try:
@@ -253,22 +202,19 @@ def _read_channels(ss):
         return []
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Google Sheets — запись
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Запись ─────────────────────────────────────────────────────────────────────
 
 def _local_now() -> datetime:
     from datetime import timezone, timedelta
-    tz_utc   = timezone.utc
-    tz_local = timezone(timedelta(hours=TZ_OFFSET_HOURS))
-    return datetime.now(tz_utc).astimezone(tz_local).replace(tzinfo=None)
+    return datetime.now(timezone.utc).astimezone(
+        __import__('datetime').timezone(__import__('datetime').timedelta(hours=TZ_OFFSET_HOURS))
+    ).replace(tzinfo=None)
 
 
 def _local_dt(dt: datetime) -> datetime:
     from datetime import timezone, timedelta
-    tz_utc   = timezone.utc
     tz_local = timezone(timedelta(hours=TZ_OFFSET_HOURS))
-    return dt.replace(tzinfo=tz_utc).astimezone(tz_local).replace(tzinfo=None)
+    return dt.replace(tzinfo=timezone.utc).astimezone(tz_local).replace(tzinfo=None)
 
 
 def _write_post(ss, post):
@@ -285,7 +231,7 @@ def _write_post(ss, post):
         ], value_input_option='USER_ENTERED')
     except Exception as e:
         log.error('Ошибка записи поста: ' + str(e), exc_info=True)
-        raise  # пробрасываем для _write_with_retry
+        raise
 
 
 def _write_rejected(ss, post, bot_message_id):
@@ -352,11 +298,7 @@ def _write_entity_cache(ss):
             ws = ss.add_worksheet('Кеш', 1000, 3)
         rows = [['username', 'entity_id', 'chat_name']]
         for uname, meta in state['username_to_meta'].items():
-            rows.append([
-                uname,
-                str(meta.get('entity_id', '')),
-                meta.get('chat_name', ''),
-            ])
+            rows.append([uname, str(meta.get('entity_id', '')), meta.get('chat_name', '')])
         ws.clear()
         ws.update(rows, value_input_option='USER_ENTERED')
         log.info(f'Кеш записан: {len(rows) - 1} каналов')
@@ -410,24 +352,47 @@ def _extract_username(raw: str):
     return None
 
 
-# БАГ 11 fix: корректная обработка граничных значений channel_id
 def _all_id_variants(entity_id: int) -> list:
+    """
+    Возвращает все варианты ID по которым может прийти event.chat_id.
+
+    Telethon возвращает entity.id без префикса 100 (например 1592206426),
+    но event.chat_id приходит с префиксом -100 (например -1001592206426).
+    abs(event.chat_id) = 1001592206426 — это и есть ключ поиска.
+
+    Поэтому храним ОБА варианта: короткий и длинный (с префиксом 100).
+    """
     eid = abs(entity_id)
     variants: set[int] = {eid}
     s = str(eid)
     try:
-        # Если id уже начинается на 100 и достаточно длинный — пробуем короткий вариант
         if s.startswith('100') and len(s) > 12:
+            # уже длинный — добавляем короткий
             short = int(s[3:])
             if short > 0:
                 variants.add(short)
         else:
-            # Добавляем вариант с префиксом 100
-            long_id = int('100' + s)
-            variants.add(long_id)
+            # короткий — добавляем длинный
+            variants.add(int('100' + s))
     except ValueError:
         pass
     return list(variants)
+
+
+def _meta_by_abs_id(id_to_meta: dict, abs_id: int):
+    """Ищет meta по abs_id, пробуя оба варианта ID."""
+    meta = id_to_meta.get(abs_id)
+    if meta is not None:
+        return meta
+    s = str(abs_id)
+    try:
+        if s.startswith('100') and len(s) > 12:
+            alt = int(s[3:])
+        else:
+            alt = int('100' + s)
+        return id_to_meta.get(alt)
+    except ValueError:
+        return None
 
 
 def _build_link(chat, msg_id: int) -> str:
@@ -457,9 +422,7 @@ def _get_author_info(msg):
         return '', ''
 
 
-# БАГ 12 fix: корректная конвертация UTF-16 offset → Unicode index
 def _utf16_to_unicode_idx(text: str, utf16_offset: int) -> int:
-    """Конвертирует UTF-16 code unit offset в индекс Unicode-символа."""
     idx = 0
     u16 = 0
     for ch in text:
@@ -489,7 +452,6 @@ def _text_to_html(text: str, entities) -> str:
     closes = {}
 
     for ent in sorted(entities, key=lambda e: (e.offset, -e.length)):
-        # БАГ 12: конвертируем UTF-16 offsets в Unicode-индексы
         o = _utf16_to_unicode_idx(text, ent.offset)
         c = _utf16_to_unicode_idx(text, ent.offset + ent.length)
 
@@ -574,17 +536,13 @@ def _tg_request(token: str, method: str, payload: dict, timeout: int = 10) -> di
                           f'(error_code={result.get("error_code")})')
             return result
     except urllib.error.HTTPError as e:
-        # Пробрасываем 409/401/403 — _get_updates должен их различать
         if e.code in (409, 401, 403):
             try:
                 body = json.loads(e.read().decode('utf-8'))
             except Exception:
                 body = {}
-            return {
-                'ok': False,
-                'error_code': e.code,
-                'description': body.get('description', str(e)),
-            }
+            return {'ok': False, 'error_code': e.code,
+                    'description': body.get('description', str(e))}
         log.error(f'TG API {method} HTTP {e.code}: {e}', exc_info=True)
         return {}
     except Exception as e:
@@ -592,7 +550,6 @@ def _tg_request(token: str, method: str, payload: dict, timeout: int = 10) -> di
         return {}
 
 
-# БАГ 8 fix: _get_updates поднимает RuntimeError при 409/Conflict
 def _get_updates(token: str, offset: int, timeout: int = 30) -> list:
     result = _tg_request(token, 'getUpdates', {
         'offset':  offset,
@@ -623,10 +580,9 @@ def _send_moderation_card(post: dict, token: str, moderator_chat_id: str) -> int
     pend_key = f'{post["src_chat_id"]}:{post["src_msg_id"]}'
 
     lines = [
-        f'📢 <b>Источник:</b>',
-        f'{post["chat_name"]}',
-        f'👤 <b>Автор:</b>',
-        f'{author_str}',
+        f'📢 <b>Источник:</b> {post["chat_name"]}',
+        f'👤 <b>Автор:</b> {author_str}',
+        f'🏆 <b>Скор:</b> {post["score"]}',
         '',
         post['html_text'][:3500],
         '',
@@ -634,8 +590,8 @@ def _send_moderation_card(post: dict, token: str, moderator_chat_id: str) -> int
     ]
 
     result = _tg_request(token, 'sendMessage', {
-        'chat_id': moderator_chat_id,
-        'text': '\n'.join(lines)[:4096],
+        'chat_id':    moderator_chat_id,
+        'text':       '\n'.join(lines)[:4096],
         'parse_mode': 'HTML',
         'disable_web_page_preview': True,
         'reply_markup': {
@@ -678,16 +634,12 @@ def _send_alert(token: str, moderator_chat_id: str, message: str):
     })
 
 
-# ── Fingerprint для дедупликации опубликованных постов ─────────────────────────
-
 def _post_fingerprint(text: str, author_name: str) -> str:
     norm = unicodedata.normalize('NFKC', text.lower())
     norm = re.sub(r'[\s\W]+', '', norm)[:120]
     author_key = re.sub(r'\s+', '', author_name.lower())
     return f'{author_key}|{norm}'
 
-
-# ── Форматирование подписи поста ──────────────────────────────────────────────
 
 def _build_caption(post: dict) -> str:
     link        = post['link']
@@ -716,9 +668,7 @@ def _build_caption(post: dict) -> str:
 
 def _bot_request_raw(url: str, data: bytes, content_type: str,
                      timeout: int = 30, label: str = '') -> dict:
-    req = urllib.request.Request(
-        url, data=data, headers={'Content-Type': content_type}
-    )
+    req = urllib.request.Request(url, data=data, headers={'Content-Type': content_type})
     for attempt in range(5):
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -779,37 +729,12 @@ def _send_album_bot(token: str, chat_id: str, caption: str, photos: list[bytes])
             item['caption'] = caption[:1024]
             item['parse_mode'] = 'HTML'
         media_json.append(item)
-
-    fields = {
-        'chat_id': chat_id,
-        'media':   json.dumps(media_json),
-    }
-    files = {f'p{i}': (f'p{i}.jpg', pb, 'image/jpeg') for i, pb in enumerate(photos)}
+    fields = {'chat_id': chat_id, 'media': json.dumps(media_json)}
+    files  = {f'p{i}': (f'p{i}.jpg', pb, 'image/jpeg') for i, pb in enumerate(photos)}
     body, ct = _build_multipart(fields, files)
     _bot_request_raw(url, body, ct, timeout=60, label='sendMediaGroup')
     time.sleep(0.3)
 
-
-def _send_text_bot(token: str, chat_id: str, text: str):
-    data = json.dumps({
-        'chat_id':    chat_id,
-        'text':       text[:4096],
-        'parse_mode': 'HTML',
-        'disable_web_page_preview': True,
-    }).encode('utf-8')
-    url = f'https://api.telegram.org/bot{token}/sendMessage'
-    req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            result = json.loads(resp.read().decode())
-            if not result.get('ok'):
-                log.error(f'sendMessage не ок: {result.get("description")}')
-    except Exception as e:
-        log.error(f'sendMessage error: {e}', exc_info=True)
-    time.sleep(0.3)
-
-
-# ── Скачивание медиа через Telethon ───────────────────────────────────────────
 
 async def _download_photos(client: TelegramClient, messages: list) -> list[bytes]:
     photos = []
@@ -828,9 +753,7 @@ async def _download_photos(client: TelegramClient, messages: list) -> list[bytes
     return photos
 
 
-# БАГ 3 fix: fetch сообщений по (chat_id, msg_id) при одобрении
 async def _fetch_messages_by_refs(client: TelegramClient, refs: list[tuple]) -> list:
-    """Загружает сообщения по списку (chat_id, msg_id) из Telegram."""
     msgs = []
     for chat_id, msg_id in refs:
         try:
@@ -850,8 +773,6 @@ def _is_image_doc(msg) -> bool:
     return mime.startswith('image/')
 
 
-# ── Публикация поста в канал (текст + медиа) ──────────────────────────────────
-
 async def _publish_post(client: TelegramClient, post: dict,
                         dest_chat: str, photos: list[bytes] | None = None):
     caption = _build_caption(post)
@@ -861,13 +782,11 @@ async def _publish_post(client: TelegramClient, post: dict,
     try:
         if photos and token:
             if len(photos) == 1:
-                await loop.run_in_executor(
-                    _executor, _send_photo_bot, token, dest_chat, caption, photos[0]
-                )
+                await loop.run_in_executor(_executor, _send_photo_bot,
+                                           token, dest_chat, caption, photos[0])
             else:
-                await loop.run_in_executor(
-                    _executor, _send_album_bot, token, dest_chat, caption, photos
-                )
+                await loop.run_in_executor(_executor, _send_album_bot,
+                                           token, dest_chat, caption, photos)
         elif photos and not token:
             await client.send_file(
                 entity=int(dest_chat),
@@ -956,7 +875,6 @@ async def _update_watched_chats(clients: dict, channels: list, ss):
     added   = new_ids - state['watched_ids']
     removed = state['watched_ids'] - new_ids
 
-    # БАГ 6 fix: обновляем state под блокировкой
     async with _state_lock:
         state['watched_ids'] = new_ids
         state['id_to_meta']  = new_id_meta
@@ -965,11 +883,15 @@ async def _update_watched_chats(clients: dict, channels: list, ss):
     if added:   log.info(f'Добавлено ID-ключей: {len(added)}')
     if removed: log.info(f'Убрано ID-ключей: {len(removed)}')
 
+    # Логируем несколько ключей для диагностики
+    sample = sorted(new_id_meta.keys())[:6]
+    log.info(f'Пример ключей id_to_meta: {sample}')
+
     await _safe_sheets(_write_entity_cache, ss)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Фоновая задача: перезагрузка настроек
+# Фоновые задачи
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _settings_reload_loop(clients: dict, ss):
@@ -982,7 +904,6 @@ async def _settings_reload_loop(clients: dict, ss):
             new_minus    = await _safe_sheets_result(_read_minus_words,   ss)
             new_channels = await _safe_sheets_result(_read_channels,      ss)
 
-            # БАГ 6 fix: обновляем state под блокировкой
             if new_settings:
                 async with _state_lock:
                     state.update({
@@ -1013,12 +934,7 @@ async def _settings_reload_loop(clients: dict, ss):
             log.error('Ошибка перезагрузки настроек: ' + str(e), exc_info=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Фоновая задача: TTL-cleanup pending_moderation (БАГ 2)
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def _cleanup_pending_loop():
-    """Раз в час удаляет из pending_moderation записи старше 24ч."""
     while True:
         await asyncio.sleep(3600)
         try:
@@ -1033,10 +949,6 @@ async def _cleanup_pending_loop():
             log.error(f'Ошибка cleanup pending: {e}', exc_info=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Фоновая задача: heartbeat / метрики (БАГ 15)
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def _heartbeat_loop():
     while True:
         await asyncio.sleep(300)
@@ -1049,10 +961,6 @@ async def _heartbeat_loop():
         )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Фоновая задача: long-polling callback_query от бота
-# ══════════════════════════════════════════════════════════════════════════════
-
 async def _bot_polling_loop(clients: dict, ss):
     offset = 0
     loop   = asyncio.get_event_loop()
@@ -1060,14 +968,12 @@ async def _bot_polling_loop(clients: dict, ss):
     def _first_client() -> TelegramClient | None:
         return next(iter(clients.values()), None)
 
-    # БАГ 8 fix: ждём освобождения слота getUpdates при старте (до 150с)
     token = state['tg_token']
     if token:
         for attempt in range(10):
             result = await loop.run_in_executor(
                 _executor, _tg_request, token, 'getUpdates',
-                {'offset': 0, 'timeout': 1, 'allowed_updates': ['callback_query']},
-                15,
+                {'offset': 0, 'timeout': 1, 'allowed_updates': ['callback_query']}, 15,
             )
             if result.get('ok'):
                 log.info('[bot_polling] Слот getUpdates свободен — стартуем')
@@ -1080,7 +986,6 @@ async def _bot_polling_loop(clients: dict, ss):
                 break
 
     while True:
-        # БАГ 6 fix: читаем копии state под блокировкой
         async with _state_lock:
             token     = state['tg_token']
             moderator = state['moderator_chat_id']
@@ -1091,13 +996,11 @@ async def _bot_polling_loop(clients: dict, ss):
             continue
 
         try:
-            updates = await loop.run_in_executor(
-                _executor, _get_updates, token, offset, 30
-            )
+            updates = await loop.run_in_executor(_executor, _get_updates, token, offset, 30)
         except RuntimeError as e:
             err_str = str(e)
             if err_str.startswith('409:'):
-                log.warning(f'[bot_polling] 409 Conflict в цикле — жду 15с + deleteWebhook')
+                log.warning('[bot_polling] 409 Conflict в цикле — жду 15с + deleteWebhook')
                 await asyncio.sleep(15)
                 await loop.run_in_executor(
                     _executor, _tg_request,
@@ -1126,8 +1029,6 @@ async def _bot_polling_loop(clients: dict, ss):
             from_id = cq.get('from', {}).get('id', '')
             msg_id  = cq.get('message', {}).get('message_id', 0)
 
-            # БАГ 13 fix: callback_data может содержать отрицательный src_chat_id
-            # "approve:-1001234567:999" → split(':', 2) → ['approve', '-1001234567', '999'] ✓
             parts = data.split(':', 2)
             if len(parts) != 3 or parts[0] not in ('approve', 'skip'):
                 await loop.run_in_executor(
@@ -1168,16 +1069,15 @@ async def _bot_polling_loop(clients: dict, ss):
                             pending_moderation.pop(pend_key, None)
                             continue
 
-                        # БАГ 3 fix: загружаем сообщения по refs, а не из памяти
-                        refs = post.get('grouped_refs', [])
+                        refs         = post.get('grouped_refs', [])
                         grouped_msgs = await _fetch_messages_by_refs(client, refs) if refs else []
-                        photos = await _download_photos(client, grouped_msgs) if grouped_msgs else []
+                        photos       = await _download_photos(client, grouped_msgs) if grouped_msgs else []
 
                         ok = await _publish_post(client, post, dest_chat, photos or None)
                         if ok:
                             published_fingerprints.append(fp)
                             metrics['published'] += 1
-                            log.info(f'[модерация ✅ одобрено фото:{len(photos)}] {post["chat_name"]} → {post["link"]}')
+                            log.info(f'[модерация ✅ фото:{len(photos)}] {post["chat_name"]} → {post["link"]}')
                             await _safe_sheets_retry(_write_post, ss, post)
                             await _safe_sheets(_update_rejected_status, ss,
                                                post.get('bot_message_id', 0), 'одобрено')
@@ -1197,7 +1097,7 @@ async def _bot_polling_loop(clients: dict, ss):
                             )
                     except Exception as e:
                         metrics['errors'] += 1
-                        log.error(f'[модерация] Ошибка публикации одобренного: {e}', exc_info=True)
+                        log.error(f'[модерация] Ошибка: {e}', exc_info=True)
                         await loop.run_in_executor(
                             _executor, _answer_callback, token, cq_id, f'❌ Ошибка: {e}'
                         )
@@ -1226,14 +1126,13 @@ async def _bot_polling_loop(clients: dict, ss):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN — регистрация хендлера + запуск
+# MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def main():
     global _sheets_lock, _state_lock
     log.info('═══ TG Parser v3 стартует ═══')
 
-    # Инициализируем asyncio.Lock-и здесь, внутри event-loop
     _sheets_lock = asyncio.Lock()
     _state_lock  = asyncio.Lock()
 
@@ -1270,7 +1169,7 @@ async def main():
         f'Настройки загружены | публикация: {state["score_threshold"]} | '
         f'модерация: {state["moderation_threshold"]} | '
         f'мин.длина: {state["min_length"]} | '
-        f'правил скоринга: {len(rules)} | минус-слов: {len(minus)}'
+        f'правил: {len(rules)} | минус-слов: {len(minus)}'
     )
 
     # ── Сбрасываем webhook ─────────────────────────────────────────────────
@@ -1312,7 +1211,7 @@ async def main():
         log.warning('Лист «Каналы» пуст — добавьте каналы')
     else:
         known = sum(1 for ch in channels if _extract_username(ch['username']) in cached_meta)
-        log.info(f'Каналов: {len(channels)} | из кеша: {known} | новых (нужен резолв): {len(channels) - known}')
+        log.info(f'Каналов: {len(channels)} | из кеша: {known} | новых: {len(channels) - known}')
 
     await _update_watched_chats(clients, channels or [], ss)
     log.info(
@@ -1321,46 +1220,19 @@ async def main():
     )
 
     # ══════════════════════════════════════════════════════════════════════
-    # Хендлер новых сообщений
+    # Буфер альбомов и хендлер
     # ══════════════════════════════════════════════════════════════════════
 
-    # ── Буфер для сборки альбомов ──────────────────────────────────────────
     album_buffer: dict = {}
 
-    # БАГ 14 fix: graceful shutdown — flush всех незавершённых альбомов
-    async def _graceful_shutdown():
-        log.info(f'SIGTERM — завершаем {len(album_buffer)} альбомов из буфера')
-        flush_tasks = []
-        for gid, entry in list(album_buffer.items()):
-            # Отменяем старый таймер
-            handle = entry.get('timer')
-            if handle:
-                handle.cancel()
-            flush_tasks.append(
-                asyncio.ensure_future(
-                    _flush_album(gid, entry['acc'], entry['client'])
-                )
-            )
-        if flush_tasks:
-            await asyncio.gather(*flush_tasks, return_exceptions=True)
-        log.info('Graceful shutdown завершён')
-
-    loop.add_signal_handler(
-        signal.SIGTERM,
-        lambda: asyncio.ensure_future(_graceful_shutdown())
-    )
-
     async def _flush_album(grouped_id: int, _acc: str, _client: TelegramClient):
-        # БАГ 1 fix: pop ДО try — буфер очищается даже при исключении
         entry = album_buffer.pop(grouped_id, None)
         if not entry:
             return
-
         try:
             msgs  = sorted(entry['msgs'], key=lambda m: m.id)
             first = msgs[0]
 
-            # БАГ 9 fix: один надёжный источник raw_id
             try:
                 raw_id = first.chat_id
             except Exception:
@@ -1368,7 +1240,6 @@ async def main():
 
             abs_id = abs(raw_id)
 
-            # БАГ 6 fix: читаем копии state под блокировкой
             async with _state_lock:
                 id_to_meta    = dict(state['id_to_meta'])
                 minus_words   = list(state['minus_words'])
@@ -1380,12 +1251,9 @@ async def main():
                 dest_chat     = state['dest_chat_id']
                 moderator     = state['moderator_chat_id']
 
-            meta = id_to_meta.get(abs_id)
+            meta = _meta_by_abs_id(id_to_meta, abs_id)
             if meta is None:
-                s   = str(abs_id)
-                alt = int(s[3:]) if s.startswith('100') and len(s) > 12 else int('100' + s)
-                meta = id_to_meta.get(alt)
-            if meta is None:
+                log.info(f'[{_acc}][альбом] abs_id={abs_id} не в списке каналов — пропуск')
                 return
 
             text = ''
@@ -1400,13 +1268,18 @@ async def main():
                     break
             html_text = _text_to_html(text, text_entities)
 
+            chat_name = meta.get('chat_name', str(abs_id))
+
             if _has_minus_word(text, minus_words):
+                log.info(f'[{_acc}][альбом минус-слово] {chat_name}')
                 return
             if len(text) < min_length:
+                log.info(f'[{_acc}][альбом короткий {len(text)}<{min_length}] {chat_name}')
                 return
 
             score = _calc_score(text, scoring_rules)
             if score < mod_threshold:
+                log.info(f'[{_acc}][альбом скор:{score}<{mod_threshold}] {chat_name}')
                 return
 
             try:
@@ -1414,8 +1287,7 @@ async def main():
             except Exception:
                 chat = None
 
-            link      = _build_link(chat, first.id) if chat else f'https://t.me/c/{abs_id}/{first.id}'
-            chat_name = meta.get('chat_name', str(abs_id))
+            link        = _build_link(chat, first.id) if chat else f'https://t.me/c/{abs_id}/{first.id}'
             author_name, author_link = _get_author_info(first)
 
             post = {
@@ -1430,16 +1302,15 @@ async def main():
                 'account':     _acc,
                 'src_chat_id': raw_id,
                 'src_msg_id':  first.id,
-                'added_at':    time.time(),  # БАГ 2: для TTL-cleanup
+                'added_at':    time.time(),
             }
 
             metrics['processed'] += 1
 
             if score >= threshold:
-                # БАГ 5 fix: добавляем fp ДО первого await
                 fp = _post_fingerprint(text, author_name)
                 if fp in published_fingerprints:
-                    log.info(f'[{_acc}][дубль альбом ⛔] {chat_name}')
+                    log.info(f'[{_acc}][альбом дубль ⛔] {chat_name}')
                     return
                 published_fingerprints.append(fp)
 
@@ -1451,10 +1322,8 @@ async def main():
                     ok = await _publish_post(_client, post, dest_chat, photos)
                     if not ok:
                         metrics['errors'] += 1
-                        log.error(f'[{_acc}] Публикация альбома не удалась: {link}')
             else:
                 log.info(f'[модерация альбом ⏳ скор:{score}/{threshold} {_acc}] {chat_name} → {link}')
-                # БАГ 3 fix: сохраняем refs вместо живых объектов
                 post['grouped_refs'] = [(m.chat_id, m.id) for m in msgs]
                 bot_msg_id = 0
                 if tg_token and moderator:
@@ -1475,12 +1344,18 @@ async def main():
 
         @client.on(events.NewMessage)
         async def _on_new_message(event, _acc=acc_label, _client=client):
-            log.info(f'[{_acc}] RAW chat_id={event.chat_id}')
             try:
+                msg = event.message
+
+                # ── FIX: пропускаем служебные и пустые сообщения ──────────
+                if isinstance(msg, (MessageService, MessageEmpty)):
+                    return
+                if getattr(msg, 'action', None) is not None:
+                    return
+
                 raw_id = event.chat_id
                 abs_id = abs(raw_id)
 
-                # БАГ 6 fix: читаем копии state под блокировкой
                 async with _state_lock:
                     id_to_meta    = dict(state['id_to_meta'])
                     minus_words   = list(state['minus_words'])
@@ -1492,28 +1367,20 @@ async def main():
                     dest_chat     = state['dest_chat_id']
                     moderator     = state['moderator_chat_id']
 
-                meta = id_to_meta.get(abs_id)
+                # ── FIX: используем _meta_by_abs_id вместо ручного alt ────
+                meta = _meta_by_abs_id(id_to_meta, abs_id)
                 if meta is None:
-                    s   = str(abs_id)
-                    alt = int(s[3:]) if s.startswith('100') and len(s) > 12 else int('100' + s)
-                    meta = id_to_meta.get(alt)
+                    return  # не наш канал, молча пропускаем
 
-                log.info(f'[{_acc}] abs_id={abs_id}, meta={meta}, id_to_meta_keys={sorted(id_to_meta.keys())[:20]}')
-                if meta is None:
-                    log.debug(f'[{_acc}] Пропущен chat_id={raw_id} (abs={abs_id}) — не в списке')
-                    return
-
-                msg = event.message
-                if msg.action is not None:
-                    return
-
-                # БАГ 10 fix: дедупликация по raw_id (со знаком), не abs_id
+                # ── Дедупликация ───────────────────────────────────────────
                 dedup_key = (raw_id, msg.id)
                 if dedup_key in seen_ids:
                     return
                 seen_ids.append(dedup_key)
 
-                # ── Альбом: собираем grouped_id в буфер ───────────────────
+                chat_name = meta.get('chat_name', str(abs_id))
+
+                # ── Альбом ─────────────────────────────────────────────────
                 grouped_id = getattr(msg, 'grouped_id', None)
                 if grouped_id:
                     if grouped_id not in album_buffer:
@@ -1530,29 +1397,30 @@ async def main():
                     return
 
                 # ── Одиночное сообщение ────────────────────────────────────
-                text = msg.text or msg.message or ''
+                text = msg.text or getattr(msg, 'message', '') or ''
                 if hasattr(msg, 'caption') and msg.caption:
                     text = msg.caption
                 text = re.sub(r'[^\S\n]+', ' ', text).strip()
                 html_text = _text_to_html(text, msg.entities)
 
                 if _has_minus_word(text, minus_words):
-                    log.debug(f'[{_acc}][минус-слово] {meta["chat_name"]} — выброс')
+                    log.info(f'[{_acc}][минус-слово] {chat_name}')
                     return
 
                 if len(text) < min_length:
-                    log.debug(f'[{_acc}][короткий] {meta["chat_name"]} ({len(text)}) — выброс')
+                    log.info(f'[{_acc}][короткий {len(text)}<{min_length}] {chat_name}')
                     return
 
                 score = _calc_score(text, scoring_rules)
                 if score < mod_threshold:
-                    log.debug(f'[{_acc}][скор:{score}<{mod_threshold}] {meta["chat_name"]} — выброс')
+                    log.info(f'[{_acc}][скор:{score}<{mod_threshold}] {chat_name} | {repr(text[:60])}')
                     return
 
-                chat      = await event.get_chat()
-                link      = _build_link(chat, msg.id)
+                chat        = await event.get_chat()
+                link        = _build_link(chat, msg.id)
                 author_name, author_link = _get_author_info(msg)
-                chat_name = meta.get('chat_name', str(abs_id))
+
+                log.info(f'[{_acc}][принят скор:{score}] {chat_name} → {link}')
 
                 post = {
                     'date':        msg.date.replace(tzinfo=None),
@@ -1566,13 +1434,12 @@ async def main():
                     'account':     _acc,
                     'src_chat_id': raw_id,
                     'src_msg_id':  msg.id,
-                    'added_at':    time.time(),  # БАГ 2: для TTL-cleanup
+                    'added_at':    time.time(),
                 }
 
                 metrics['processed'] += 1
 
                 if score >= threshold:
-                    # БАГ 5 fix: добавляем fp ДО первого await
                     fp = _post_fingerprint(text, author_name)
                     if fp in published_fingerprints:
                         log.info(f'[{_acc}][дубль ⛔] {chat_name}')
@@ -1596,8 +1463,7 @@ async def main():
                             _executor, _send_moderation_card, post, tg_token, moderator,
                         )
                     post['bot_message_id'] = bot_msg_id
-                    # БАГ 3 fix: сохраняем refs вместо живых объектов
-                    post['grouped_refs'] = [(msg.chat_id, msg.id)]
+                    post['grouped_refs']   = [(msg.chat_id, msg.id)]
                     pend_key = f'{raw_id}:{msg.id}'
                     pending_moderation[pend_key] = post
                     metrics['moderated'] += 1
@@ -1621,15 +1487,13 @@ async def main():
     # ── Фоновые задачи ─────────────────────────────────────────────────────
     asyncio.create_task(_settings_reload_loop(clients, ss))
     asyncio.create_task(_bot_polling_loop(clients, ss))
-    asyncio.create_task(_cleanup_pending_loop())   # БАГ 2
-    asyncio.create_task(_heartbeat_loop())          # БАГ 15
+    asyncio.create_task(_cleanup_pending_loop())
+    asyncio.create_task(_heartbeat_loop())
 
     log.info(
         f'Слушаю события. '
         f'Настройки обновляются каждые {SETTINGS_RELOAD_SEC}с. '
-        f'Bot polling запущен. '
-        f'Cleanup pending: каждый час. '
-        f'Heartbeat: каждые 5 мин.'
+        f'Bot polling запущен.'
     )
 
     await asyncio.gather(*[c.run_until_disconnected() for c in clients.values()])
