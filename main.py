@@ -570,8 +570,23 @@ def _tg_request(token: str, method: str, payload: dict, timeout: int = 10) -> di
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             result = json.loads(resp.read().decode('utf-8'))
             if not result.get('ok'):
-                log.error(f'TG API {method} не ок: {result.get("description")} (error_code={result.get("error_code")})')
+                log.error(f'TG API {method} не ок: {result.get("description")} '
+                          f'(error_code={result.get("error_code")})')
             return result
+    except urllib.error.HTTPError as e:
+        # Пробрасываем 409/401/403 — _get_updates должен их различать
+        if e.code in (409, 401, 403):
+            try:
+                body = json.loads(e.read().decode('utf-8'))
+            except Exception:
+                body = {}
+            return {
+                'ok': False,
+                'error_code': e.code,
+                'description': body.get('description', str(e)),
+            }
+        log.error(f'TG API {method} HTTP {e.code}: {e}', exc_info=True)
+        return {}
     except Exception as e:
         log.error(f'TG API {method} error: {e}', exc_info=True)
         return {}
