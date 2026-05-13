@@ -71,10 +71,18 @@ state = {
     'username_to_meta':  {},
 }
 
-# Дедупликация входящих сообщений
+# Часовой пояс для записи в таблицу (GMT+3)
+TZ_OFFSET_HOURS = 3
+
+# Дедупликация входящих сообщений (chat_id, msg_id)
 seen_ids: deque = deque(maxlen=2000)
 
-# pending_moderation: bot_message_id → post dict  (для обработки callback)
+# Дедупликация опубликованных постов по тексту+автору
+# Храним (fingerprint) последних 500 опубликованных, чтобы не дублировать
+# одно объявление из нескольких групп.
+published_fingerprints: deque = deque(maxlen=500)
+
+# pending_moderation: '{src_chat_id}:{src_msg_id}' → post dict
 pending_moderation: dict = {}
 
 _executor = ThreadPoolExecutor(max_workers=4)
@@ -169,10 +177,22 @@ def _read_channels(ss):
 # Google Sheets — запись
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _local_now() -> datetime:
+    """Текущее время GMT+3 (без зависимости от pytz/zoneinfo)."""
+    from datetime import timedelta
+    return datetime.utcnow() + timedelta(hours=TZ_OFFSET_HOURS)
+
+
+def _local_dt(dt: datetime) -> datetime:
+    """Конвертирует UTC datetime в GMT+3."""
+    from datetime import timedelta
+    return dt + timedelta(hours=TZ_OFFSET_HOURS)
+
+
 def _write_post(ss, post):
     try:
         ss.worksheet('Посты').append_row([
-            post['date'].strftime('%Y-%m-%d %H:%M:%S'),
+            _local_dt(post['date']).strftime('%Y-%m-%d %H:%M:%S'),
             post['chat_name'],
             post['author_name'],
             post['author_link'],
@@ -188,7 +208,7 @@ def _write_post(ss, post):
 def _write_rejected(ss, post, bot_message_id):
     try:
         ss.worksheet('Отклонённые').append_row([
-            post['date'].strftime('%Y-%m-%d %H:%M:%S'),
+            _local_dt(post['date']).strftime('%Y-%m-%d %H:%M:%S'),
             post['chat_name'],
             post['link'],
             post['text'],
@@ -207,7 +227,7 @@ def _write_log(ss, level, message, account=''):
         if safe and safe[0] in '=+-@':
             safe = "'" + safe
         ss.worksheet('Логи').append_row(
-            [datetime.now().strftime('%Y-%m-%d %H:%M:%S'), level, safe, str(account)],
+            [_local_now().strftime('%Y-%m-%d %H:%M:%S'), level, safe, str(account)],
             value_input_option='USER_ENTERED',
         )
     except Exception as e:
@@ -330,12 +350,12 @@ def _calc_score(text: str, rules: list) -> int:
 # Telegram Bot API
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _tg_request(token: str, method: str, payload: dict) -> dict:
+def _tg_request(token: str, method: str, payload: dict, timeout: int = 10) -> dict:
     url  = f'https://api.telegram.org/bot{token}/{method}'
     data = json.dumps(payload).encode('utf-8')
     req  = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             result = json.loads(resp.read().decode('utf-8'))
             if not result.get('ok'):
                 log.error(f'TG API {method} не ок: {result.get("description")}')
@@ -386,16 +406,15 @@ def _answer_callback(token: str, callback_query_id: str, text: str):
 
 
 def _edit_message_reply_markup(token: str, chat_id: str, message_id: int, new_text: str):
-    """Убирает кнопки после решения модератора и дописывает статус."""
+    """Убирает кнопки после решения модератора и дописывает статус реплаем."""
     _tg_request(token, 'editMessageReplyMarkup', {
         'chat_id':      chat_id,
         'message_id':   message_id,
         'reply_markup': {'inline_keyboard': []},
     })
-    # Добавляем статусную строку отдельным сообщением (editMessageText сложнее)
     _tg_request(token, 'sendMessage', {
-        'chat_id':  chat_id,
-        'text':     new_text,
+        'chat_id':             chat_id,
+        'text':                new_text,
         'reply_to_message_id': message_id,
     })
 
@@ -409,12 +428,85 @@ def _send_alert(token: str, moderator_chat_id: str, message: str):
     })
 
 
+# ── Fingerprint для дедупликации опубликованных постов ─────────────────────────
+
+def _post_fingerprint(text: str, author_name: str) -> str:
+    """
+    Нормализованный ключ (текст + автор) для поиска дублей.
+    Убираем пунктуацию/пробелы, берём первые 120 символов текста —
+    этого достаточно чтобы поймать «чуть изменённые» копии.
+    """
+    import unicodedata
+    norm = unicodedata.normalize('NFKC', text.lower())
+    norm = re.sub(r'[\s\W]+', '', norm)[:120]
+    author_key = re.sub(r'\s+', '', author_name.lower())
+    return f'{author_key}|{norm}'
+
+
+# ── Форматированная публикация поста в канал ───────────────────────────────────
+
+def _build_post_html(post: dict) -> str:
+    """
+    Формирует текст поста для отправки в канал от имени канала (без «переслано от»).
+
+    Формат:
+        <текст поста>
+
+        <a href="ссылка_на_источник">Источник</a> · <a href="ссылка_на_автора">Имя автора</a>
+
+    Если автор неизвестен — только «Источник».
+    Если источник — приватный чат (ссылка t.me/c/...) — подпись «Источник» без имени канала,
+    иначе используем название канала как текст ссылки.
+    """
+    text = post['text'][:4000]  # оставляем место под подпись
+
+    # Ссылка на источник
+    link        = post['link']
+    chat_name   = post.get('chat_name', '')
+    source_text = chat_name if chat_name else 'Источник'
+    source_html = f'<a href="{link}">{source_text}</a>'
+
+    # Ссылка на автора
+    author_name = post.get('author_name', '').strip()
+    author_link = post.get('author_link', '').strip()
+
+    if author_name and author_link:
+        author_html = f'<a href="{author_link}">{author_name}</a>'
+        footer = f'{source_html} · {author_html}'
+    elif author_name:
+        footer = f'{source_html} · {author_name}'
+    else:
+        footer = source_html
+
+    return f'{text}\n\n{footer}'
+
+
+async def _publish_post(client: TelegramClient, post: dict, dest_chat: str):
+    """
+    Отправляет пост в канал через Telethon sendMessage — от имени канала,
+    без плашки «переслано от». Возвращает True при успехе.
+    """
+    html = _build_post_html(post)
+    try:
+        await client.send_message(
+            entity=int(dest_chat),
+            message=html,
+            parse_mode='html',
+            link_preview=False,
+        )
+        return True
+    except Exception as e:
+        log.error(f'Ошибка публикации поста: {e}')
+        return False
+
+
 def _get_updates(token: str, offset: int, timeout: int = 30) -> list:
+    # Сокет-таймаут больше polling-таймаута, чтобы не обрывать соединение раньше ответа
     result = _tg_request(token, 'getUpdates', {
         'offset':  offset,
         'timeout': timeout,
         'allowed_updates': ['callback_query'],
-    })
+    }, timeout=timeout + 10)
     return result.get('result', [])
 
 
@@ -605,39 +697,58 @@ async def _bot_polling_loop(clients: dict, ss):
                 continue
 
             if action == 'approve':
-                # ── Публикуем через Telethon ───────────────────────────────
+                # ── Публикуем через Telethon (от имени канала) ────────────
                 client = _first_client()
                 if client and dest_chat:
                     try:
-                        await client.forward_messages(
-                            entity=int(dest_chat),
-                            messages=int(src_msg_id_str),
-                            from_peer=int(src_chat_id_str),
-                        )
-                        log.info(
-                            f'[модерация ✅ одобрено] '
-                            f'{post["chat_name"]} → {post["link"]}'
-                        )
-                        # Пишем в лист «Посты»
-                        await loop.run_in_executor(_executor, _write_post, ss, post)
-                        # Обновляем статус в «Отклонённых»
-                        await loop.run_in_executor(
-                            _executor, _update_rejected_status,
-                            ss, post.get('bot_message_id', 0), 'одобрено'
-                        )
-                        await loop.run_in_executor(
-                            _executor, _answer_callback, token, cq_id, '✅ Опубликовано!'
-                        )
-                        await loop.run_in_executor(
-                            _executor, _edit_message_reply_markup,
-                            token, moderator, msg_id,
-                            f'✅ Опубликовано модератором {from_id}'
-                        )
+                        # Проверяем дубли и при одобрении через модерацию
+                        fp = _post_fingerprint(post['text'], post['author_name'])
+                        if fp in published_fingerprints:
+                            log.info(
+                                f'[модерация ⛔ дубль] {post["chat_name"]} — уже опубликовано'
+                            )
+                            await loop.run_in_executor(
+                                _executor, _answer_callback, token, cq_id,
+                                '⛔ Дубль — такой пост уже опубликован'
+                            )
+                            await loop.run_in_executor(
+                                _executor, _edit_message_reply_markup,
+                                token, moderator, msg_id,
+                                '⛔ Дубль — публикация отменена'
+                            )
+                            pending_moderation.pop(pend_key, None)
+                            continue
+
+                        ok = await _publish_post(client, post, dest_chat)
+                        if ok:
+                            published_fingerprints.append(fp)
+                            log.info(
+                                f'[модерация ✅ одобрено] '
+                                f'{post["chat_name"]} → {post["link"]}'
+                            )
+                            await loop.run_in_executor(_executor, _write_post, ss, post)
+                            await loop.run_in_executor(
+                                _executor, _update_rejected_status,
+                                ss, post.get('bot_message_id', 0), 'одобрено'
+                            )
+                            await loop.run_in_executor(
+                                _executor, _answer_callback, token, cq_id, '✅ Опубликовано!'
+                            )
+                            await loop.run_in_executor(
+                                _executor, _edit_message_reply_markup,
+                                token, moderator, msg_id,
+                                f'✅ Опубликовано модератором {from_id}'
+                            )
+                        else:
+                            await loop.run_in_executor(
+                                _executor, _answer_callback, token, cq_id,
+                                '❌ Ошибка публикации — смотрите логи'
+                            )
                     except Exception as e:
-                        log.error(f'[модерация] Ошибка пересылки одобренного: {e}')
+                        log.error(f'[модерация] Ошибка публикации одобренного: {e}')
                         await loop.run_in_executor(
                             _executor, _answer_callback, token, cq_id,
-                            f'❌ Ошибка пересылки: {e}'
+                            f'❌ Ошибка: {e}'
                         )
                 else:
                     await loop.run_in_executor(
@@ -798,6 +909,12 @@ async def main():
 
                 # ── Скоринг ────────────────────────────────────────────────
                 score     = _calc_score(text, state['scoring_rules'])
+
+                # Скор 0 — не представляет интереса, тихо пропускаем
+                if score == 0:
+                    log.debug(f'[{_acc}][скор=0] {meta["chat_name"]} — выброс')
+                    return
+
                 chat      = await event.get_chat()
                 link      = _build_link(chat, msg.id)
                 author_name, author_link = _get_author_info(msg)
@@ -822,18 +939,22 @@ async def main():
                 moderator = state['moderator_chat_id']
 
                 if score >= threshold:
-                    # ── Авто-публикация через Telethon ─────────────────────
+                    # ── Проверка дублей по тексту + автору ────────────────
+                    fp = _post_fingerprint(text, author_name)
+                    if fp in published_fingerprints:
+                        log.info(
+                            f'[{_acc}][дубль ⛔] {chat_name} — текст+автор уже публиковались'
+                        )
+                        return
+                    published_fingerprints.append(fp)
+
+                    # ── Авто-публикация от имени канала ───────────────────
                     await loop.run_in_executor(_executor, _write_post, ss, post)
                     log.info(f'[авто ✅ скор:{score} {_acc}] {chat_name} → {link}')
                     if dest_chat:
-                        try:
-                            await _client.forward_messages(
-                                entity=int(dest_chat),
-                                messages=msg.id,
-                                from_peer=raw_id,
-                            )
-                        except Exception as e:
-                            log.error(f'[{_acc}] Ошибка авто-пересылки: {e}')
+                        ok = await _publish_post(_client, post, dest_chat)
+                        if not ok:
+                            log.error(f'[{_acc}] Публикация не удалась: {link}')
                 else:
                     # ── На модерацию: карточка с inline-кнопками ───────────
                     log.info(
