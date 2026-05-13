@@ -957,8 +957,13 @@ async def _bot_polling_loop(clients: dict, ss):
                 _executor, _get_updates, token, offset, 30
             )
         except Exception as e:
-            log.error(f'[bot_polling] getUpdates error: {e}')
-            await asyncio.sleep(5)
+            err_str = str(e)
+            if '409' in err_str:
+                log.warning('[bot_polling] 409 Conflict — другой инстанс ещё жив, жду 15с...')
+                await asyncio.sleep(15)
+            else:
+                log.error(f'[bot_polling] getUpdates error: {e}')
+                await asyncio.sleep(5)
             continue
 
         for upd in updates:
