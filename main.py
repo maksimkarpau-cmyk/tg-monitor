@@ -11,6 +11,7 @@ TG Parser v3 — один аккаунт (или два), скоринг + мо�
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
@@ -179,14 +180,18 @@ def _read_channels(ss):
 
 def _local_now() -> datetime:
     """Текущее время GMT+3 (без зависимости от pytz/zoneinfo)."""
-    from datetime import timedelta
-    return datetime.utcnow() + timedelta(hours=TZ_OFFSET_HOURS)
+    from datetime import timezone, timedelta
+    tz_utc = timezone.utc
+    tz_local = timezone(timedelta(hours=TZ_OFFSET_HOURS))
+    return datetime.now(tz_utc).astimezone(tz_local).replace(tzinfo=None)
 
 
 def _local_dt(dt: datetime) -> datetime:
-    """Конвертирует UTC datetime в GMT+3."""
-    from datetime import timedelta
-    return dt + timedelta(hours=TZ_OFFSET_HOURS)
+    """Конвертирует UTC datetime в GMT+3. dt ожидается naive (без tzinfo)."""
+    from datetime import timezone, timedelta
+    tz_utc = timezone.utc
+    tz_local = timezone(timedelta(hours=TZ_OFFSET_HOURS))
+    return dt.replace(tzinfo=tz_utc).astimezone(tz_local).replace(tzinfo=None)
 
 
 def _write_post(ss, post):
@@ -443,57 +448,226 @@ def _post_fingerprint(text: str, author_name: str) -> str:
     return f'{author_key}|{norm}'
 
 
-# ── Форматированная публикация поста в канал ───────────────────────────────────
+# ── Форматирование подписи поста ──────────────────────────────────────────────
 
-def _build_post_html(post: dict) -> str:
+def _build_caption(post: dict) -> str:
     """
-    Формирует текст поста для отправки в канал от имени канала (без «переслано от»).
+    Собирает подпись поста:
+      <оригинальный текст>
 
-    Формат:
-        <текст поста>
+      <a href="ссылка">Название канала</a> · <a href="ссылка_автора">Имя автора</a>
 
-        <a href="ссылка_на_источник">Источник</a> · <a href="ссылка_на_автора">Имя автора</a>
-
-    Если автор неизвестен — только «Источник».
-    Если источник — приватный чат (ссылка t.me/c/...) — подпись «Источник» без имени канала,
-    иначе используем название канала как текст ссылки.
+    Текст НЕ нормализуется — переносы строк и форматирование сохраняются.
+    Обрезается до 1024 символов (лимит caption у Bot API / Telethon).
     """
-    text = post['text'][:4000]  # оставляем место под подпись
-
-    # Ссылка на источник
     link        = post['link']
-    chat_name   = post.get('chat_name', '')
-    source_text = chat_name if chat_name else 'Источник'
-    source_html = f'<a href="{link}">{source_text}</a>'
+    chat_name   = post.get('chat_name', '') or 'Источник'
+    source_html = f'<a href="{link}">{chat_name}</a>'
 
-    # Ссылка на автора
     author_name = post.get('author_name', '').strip()
     author_link = post.get('author_link', '').strip()
 
     if author_name and author_link:
-        author_html = f'<a href="{author_link}">{author_name}</a>'
-        footer = f'{source_html} · {author_html}'
+        footer = f'{source_html} · <a href="{author_link}">{author_name}</a>'
     elif author_name:
         footer = f'{source_html} · {author_name}'
     else:
         footer = source_html
 
+    text = post['text']
+    # Оставляем место под футер (~80 символов)
+    max_text = 1024 - len(footer) - 4  # 4 = '\n\n' + запас
+    if len(text) > max_text:
+        text = text[:max_text].rstrip() + '…'
+
     return f'{text}\n\n{footer}'
 
 
-async def _publish_post(client: TelegramClient, post: dict, dest_chat: str):
+# ── Bot API helpers для отправки медиа ────────────────────────────────────────
+
+def _bot_request_raw(url: str, data: bytes, content_type: str,
+                     timeout: int = 30, label: str = '') -> dict:
+    """Выполняет multipart или JSON запрос к Bot API с retry на 429."""
+    req = urllib.request.Request(
+        url, data=data, headers={'Content-Type': content_type}
+    )
+    for attempt in range(5):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                result = json.loads(resp.read().decode('utf-8'))
+                if not result.get('ok'):
+                    log.error(f'[{label}] Bot API не ок: {result.get("description")}')
+                return result
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                retry_after = int(e.headers.get('Retry-After', 15))
+                log.warning(f'[{label}] Bot API 429 — жду {retry_after}s')
+                time.sleep(retry_after + 1)
+            else:
+                log.error(f'[{label}] Bot API HTTP {e.code}: {e}')
+                return {}
+        except Exception as e:
+            log.error(f'[{label}] Bot API error: {e}')
+            return {}
+    return {}
+
+
+def _build_multipart(fields: dict, files: dict) -> tuple[bytes, str]:
     """
-    Отправляет пост в канал через Telethon sendMessage — от имени канала,
-    без плашки «переслано от». Возвращает True при успехе.
+    Собирает multipart/form-data вручную (без внешних зависимостей).
+    fields: {name: str_value}
+    files:  {name: (filename, bytes_data, mime)}
+    Возвращает (body_bytes, content_type_header).
     """
-    html = _build_post_html(post)
-    try:
-        await client.send_message(
-            entity=int(dest_chat),
-            message=html,
-            parse_mode='html',
-            link_preview=False,
+    boundary = 'B' + str(int(time.time() * 1000))
+    parts = []
+    for name, value in fields.items():
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
+            f'{value}'.encode('utf-8')
         )
+    for name, (filename, data, mime) in files.items():
+        header = (
+            f'--{boundary}\r\n'
+            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+            f'Content-Type: {mime}\r\n\r\n'
+        ).encode('utf-8')
+        parts.append(header + data)
+    body = b'\r\n'.join(parts) + f'\r\n--{boundary}--'.encode('utf-8')
+    return body, f'multipart/form-data; boundary={boundary}'
+
+
+def _send_photo_bot(token: str, chat_id: str, caption: str, photo: bytes):
+    """Отправляет одно фото через Bot API sendPhoto."""
+    url = f'https://api.telegram.org/bot{token}/sendPhoto'
+    body, ct = _build_multipart(
+        fields={'chat_id': chat_id, 'caption': caption[:1024], 'parse_mode': 'HTML'},
+        files={'photo': ('photo.jpg', photo, 'image/jpeg')},
+    )
+    _bot_request_raw(url, body, ct, timeout=30, label='sendPhoto')
+    time.sleep(0.3)
+
+
+def _send_album_bot(token: str, chat_id: str, caption: str, photos: list[bytes]):
+    """
+    Отправляет альбом через Bot API sendMediaGroup.
+    Первая фотография получает caption. Максимум 10 фото.
+    """
+    photos = photos[:10]
+    url = f'https://api.telegram.org/bot{token}/sendMediaGroup'
+    media_json = []
+    for i in range(len(photos)):
+        item: dict = {'type': 'photo', 'media': f'attach://p{i}'}
+        if i == 0:
+            item['caption'] = caption[:1024]
+            item['parse_mode'] = 'HTML'
+        media_json.append(item)
+
+    fields = {
+        'chat_id': chat_id,
+        'media':   json.dumps(media_json),
+    }
+    files = {f'p{i}': (f'p{i}.jpg', pb, 'image/jpeg') for i, pb in enumerate(photos)}
+    body, ct = _build_multipart(fields, files)
+    _bot_request_raw(url, body, ct, timeout=60, label='sendMediaGroup')
+    time.sleep(0.3)
+
+
+def _send_text_bot(token: str, chat_id: str, text: str):
+    """Отправляет текстовое сообщение через Bot API (fallback)."""
+    data = json.dumps({
+        'chat_id':    chat_id,
+        'text':       text[:4096],
+        'parse_mode': 'HTML',
+        'disable_web_page_preview': True,
+    }).encode('utf-8')
+    url = f'https://api.telegram.org/bot{token}/sendMessage'
+    req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode())
+            if not result.get('ok'):
+                log.error(f'sendMessage не ок: {result.get("description")}')
+    except Exception as e:
+        log.error(f'sendMessage error: {e}')
+    time.sleep(0.3)
+
+
+# ── Скачивание медиа через Telethon ───────────────────────────────────────────
+
+async def _download_photos(client: TelegramClient, messages: list) -> list[bytes]:
+    """
+    Скачивает все фото/документы-изображения из списка сообщений.
+    Пропускает файлы > 10 МБ и не-изображения.
+    """
+    photos = []
+    for m in messages:
+        media = m.photo or (m.document if _is_image_doc(m) else None)
+        if not media:
+            continue
+        try:
+            buf = io.BytesIO()
+            await asyncio.wait_for(client.download_media(m, file=buf), timeout=30)
+            photos.append(buf.getvalue())
+        except asyncio.TimeoutError:
+            log.warning(f'download_media timeout msg_id={m.id}')
+        except Exception as e:
+            log.warning(f'download_media error msg_id={m.id}: {e}')
+    return photos
+
+
+def _is_image_doc(msg) -> bool:
+    """True если document это изображение (jpeg/png/webp/gif)."""
+    doc = getattr(msg, 'document', None)
+    if not doc:
+        return False
+    mime = getattr(doc, 'mime_type', '') or ''
+    return mime.startswith('image/')
+
+
+# ── Публикация поста в канал (текст + медиа) ──────────────────────────────────
+
+async def _publish_post(client: TelegramClient, post: dict,
+                        dest_chat: str, photos: list[bytes] | None = None):
+    """
+    Публикует пост в канал от имени канала (без «переслано от»).
+
+    Если есть фото — использует Bot API (sendPhoto / sendMediaGroup),
+    так как Telethon.send_file требует upload а не bytes.
+    Если фото нет — отправляет через Telethon send_message (HTML).
+
+    Возвращает True при успехе.
+    """
+    caption  = _build_caption(post)
+    token    = state.get('tg_token', '')
+
+    try:
+        if photos and token:
+            # Bot API: канал видит бота как автора — нормально для публикации
+            if len(photos) == 1:
+                await asyncio.get_event_loop().run_in_executor(
+                    _executor, _send_photo_bot, token, dest_chat, caption, photos[0]
+                )
+            else:
+                await asyncio.get_event_loop().run_in_executor(
+                    _executor, _send_album_bot, token, dest_chat, caption, photos
+                )
+        elif photos and not token:
+            # Нет токена — шлём через Telethon, фото как bytes через upload
+            await client.send_file(
+                entity=int(dest_chat),
+                file=photos if len(photos) > 1 else photos[0],
+                caption=caption,
+                parse_mode='html',
+            )
+        else:
+            # Только текст — Telethon
+            await client.send_message(
+                entity=int(dest_chat),
+                message=caption,
+                parse_mode='html',
+                link_preview=False,
+            )
         return True
     except Exception as e:
         log.error(f'Ошибка публикации поста: {e}')
@@ -701,31 +875,28 @@ async def _bot_polling_loop(clients: dict, ss):
                 client = _first_client()
                 if client and dest_chat:
                     try:
-                        # Проверяем дубли и при одобрении через модерацию
                         fp = _post_fingerprint(post['text'], post['author_name'])
                         if fp in published_fingerprints:
-                            log.info(
-                                f'[модерация ⛔ дубль] {post["chat_name"]} — уже опубликовано'
-                            )
+                            log.info(f'[модерация ⛔ дубль] {post["chat_name"]}')
                             await loop.run_in_executor(
                                 _executor, _answer_callback, token, cq_id,
                                 '⛔ Дубль — такой пост уже опубликован'
                             )
                             await loop.run_in_executor(
                                 _executor, _edit_message_reply_markup,
-                                token, moderator, msg_id,
-                                '⛔ Дубль — публикация отменена'
+                                token, moderator, msg_id, '⛔ Дубль — публикация отменена'
                             )
                             pending_moderation.pop(pend_key, None)
                             continue
 
-                        ok = await _publish_post(client, post, dest_chat)
+                        # Скачиваем фото (они были сохранены при поступлении)
+                        grouped_msgs = post.get('grouped_msgs', [])
+                        photos = await _download_photos(client, grouped_msgs) if grouped_msgs else []
+
+                        ok = await _publish_post(client, post, dest_chat, photos or None)
                         if ok:
                             published_fingerprints.append(fp)
-                            log.info(
-                                f'[модерация ✅ одобрено] '
-                                f'{post["chat_name"]} → {post["link"]}'
-                            )
+                            log.info(f'[модерация ✅ одобрено фото:{len(photos)}] {post["chat_name"]} → {post["link"]}')
                             await loop.run_in_executor(_executor, _write_post, ss, post)
                             await loop.run_in_executor(
                                 _executor, _update_rejected_status,
@@ -747,8 +918,7 @@ async def _bot_polling_loop(clients: dict, ss):
                     except Exception as e:
                         log.error(f'[модерация] Ошибка публикации одобренного: {e}')
                         await loop.run_in_executor(
-                            _executor, _answer_callback, token, cq_id,
-                            f'❌ Ошибка: {e}'
+                            _executor, _answer_callback, token, cq_id, f'❌ Ошибка: {e}'
                         )
                 else:
                     await loop.run_in_executor(
@@ -859,15 +1029,116 @@ async def main():
     # Пересылка идёт через Telethon (тот же client), бот — только для карточек.
     # ══════════════════════════════════════════════════════════════════════
 
+    # ── Буфер для сборки альбомов ──────────────────────────────────────────
+    # grouped_id → {'msgs': [...], 'timer': asyncio.TimerHandle, 'client': ..., 'acc': str}
+    album_buffer: dict = {}
+
+    async def _flush_album(grouped_id: int, _acc: str, _client: TelegramClient):
+        """Вызывается через 1.5с после первого сообщения группы — обрабатывает альбом."""
+        entry = album_buffer.pop(grouped_id, None)
+        if not entry:
+            return
+        msgs = sorted(entry['msgs'], key=lambda m: m.id)
+        first = msgs[0]
+
+        raw_id = first.peer_id.channel_id if hasattr(first.peer_id, 'channel_id') else first.chat_id
+        # Нормализуем: событие могло прийти с разными форматами
+        try:
+            raw_id = first.chat_id
+        except Exception:
+            pass
+        abs_id = abs(raw_id)
+
+        meta = state['id_to_meta'].get(abs_id)
+        if meta is None:
+            s = str(abs_id)
+            alt = int(s[3:]) if s.startswith('100') and len(s) > 12 else int('100' + s)
+            meta = state['id_to_meta'].get(alt)
+        if meta is None:
+            return
+
+        # Берём текст из первого сообщения с непустым текстом
+        text = ''
+        for m in msgs:
+            t = m.text or m.message or ''
+            if hasattr(m, 'caption') and m.caption:
+                t = m.caption
+            if t.strip():
+                text = t
+                break
+
+        if _has_minus_word(text, state['minus_words']):
+            return
+        if len(text) < state['min_length']:
+            return
+
+        score = _calc_score(text, state['scoring_rules'])
+        if score == 0:
+            return
+
+        try:
+            chat = await _client.get_entity(raw_id)
+        except Exception:
+            chat = None
+
+        link      = _build_link(chat, first.id) if chat else f'https://t.me/c/{abs_id}/{first.id}'
+        chat_name = meta.get('chat_name', str(abs_id))
+        author_name, author_link = _get_author_info(first)
+
+        post = {
+            'date':        first.date.replace(tzinfo=None),
+            'chat_name':   chat_name,
+            'author_name': author_name,
+            'author_link': author_link,
+            'link':        link,
+            'text':        text,
+            'score':       score,
+            'account':     _acc,
+            'src_chat_id': raw_id,
+            'src_msg_id':  first.id,
+        }
+
+        tg_token  = state['tg_token']
+        threshold = state['score_threshold']
+        dest_chat = state['dest_chat_id']
+        moderator = state['moderator_chat_id']
+
+        if score >= threshold:
+            fp = _post_fingerprint(text, author_name)
+            if fp in published_fingerprints:
+                log.info(f'[{_acc}][дубль альбом ⛔] {chat_name}')
+                return
+            published_fingerprints.append(fp)
+
+            photos = await _download_photos(_client, msgs)
+            await loop.run_in_executor(_executor, _write_post, ss, post)
+            log.info(f'[авто альбом ✅ скор:{score} фото:{len(photos)} {_acc}] {chat_name} → {link}')
+            if dest_chat:
+                ok = await _publish_post(_client, post, dest_chat, photos)
+                if not ok:
+                    log.error(f'[{_acc}] Публикация альбома не удалась: {link}')
+        else:
+            log.info(f'[модерация альбом ⏳ скор:{score}/{threshold} {_acc}] {chat_name} → {link}')
+            post['photos_count'] = len(msgs)  # фото скачаем только при одобрении
+            bot_msg_id = 0
+            if tg_token and moderator:
+                bot_msg_id = await loop.run_in_executor(
+                    _executor, _send_moderation_card, post, tg_token, moderator,
+                )
+            post['bot_message_id'] = bot_msg_id
+            post['grouped_msgs']   = msgs  # сохраняем для скачивания при одобрении
+            pend_key = f'{raw_id}:{first.id}'
+            pending_moderation[pend_key] = post
+            await loop.run_in_executor(_executor, _write_rejected, ss, post, bot_msg_id)
+
     for acc_label, client in clients.items():
 
         @client.on(events.NewMessage)
         async def _on_new_message(event, _acc=acc_label, _client=client):
             try:
-                raw_id = event.chat_id   # -1001234567890
-                abs_id = abs(raw_id)     #  1001234567890
+                raw_id = event.chat_id
+                abs_id = abs(raw_id)
 
-                # Ищем мета по всем вариантам ID
                 meta = state['id_to_meta'].get(abs_id)
                 if meta is None:
                     s = str(abs_id)
@@ -880,37 +1151,49 @@ async def main():
 
                 msg = event.message
                 if msg.action is not None:
-                    return  # служебное (пин, вход и т.д.)
+                    return
 
-                # ── Дедупликация ───────────────────────────────────────────
+                # ── Дедупликация входящих ──────────────────────────────────
                 dedup_key = (abs_id, msg.id)
                 if dedup_key in seen_ids:
                     return
                 seen_ids.append(dedup_key)
 
-                # ── Текст ──────────────────────────────────────────────────
+                # ── Альбом: собираем grouped_id в буфер ───────────────────
+                grouped_id = getattr(msg, 'grouped_id', None)
+                if grouped_id:
+                    if grouped_id not in album_buffer:
+                        # Запускаем таймер — через 1.5с обрабатываем всю группу
+                        handle = loop.call_later(
+                            1.5, lambda gid=grouped_id: asyncio.ensure_future(
+                                _flush_album(gid, _acc, _client)
+                            )
+                        )
+                        album_buffer[grouped_id] = {
+                            'msgs': [], 'timer': handle,
+                            'acc': _acc, 'client': _client,
+                        }
+                    album_buffer[grouped_id]['msgs'].append(msg)
+                    return  # одиночную обработку не делаем — ждём таймер
+
+                # ── Одиночное сообщение ────────────────────────────────────
+                # Текст — без flatten, сохраняем оригинальное форматирование
                 text = msg.text or msg.message or ''
                 if hasattr(msg, 'caption') and msg.caption:
                     text = msg.caption
-                text = ' '.join(text.split())
+                # Только нормализуем множественные пробелы в пределах строки,
+                # но НЕ трогаем переносы строк
+                text = re.sub(r'[^\S\n]+', ' ', text).strip()
 
-                # ── Фильтр: минус-слова ────────────────────────────────────
-                if text and _has_minus_word(text, state['minus_words']):
+                if _has_minus_word(text, state['minus_words']):
                     log.debug(f'[{_acc}][минус-слово] {meta["chat_name"]} — выброс')
                     return
 
-                # ── Фильтр: минимальная длина ─────────────────────────────
                 if len(text) < state['min_length']:
-                    log.debug(
-                        f'[{_acc}][короткий] {meta["chat_name"]} '
-                        f'({len(text)} < {state["min_length"]} симв) — выброс'
-                    )
+                    log.debug(f'[{_acc}][короткий] {meta["chat_name"]} ({len(text)}) — выброс')
                     return
 
-                # ── Скоринг ────────────────────────────────────────────────
-                score     = _calc_score(text, state['scoring_rules'])
-
-                # Скор 0 — не представляет интереса, тихо пропускаем
+                score = _calc_score(text, state['scoring_rules'])
                 if score == 0:
                     log.debug(f'[{_acc}][скор=0] {meta["chat_name"]} — выброс')
                     return
@@ -939,43 +1222,33 @@ async def main():
                 moderator = state['moderator_chat_id']
 
                 if score >= threshold:
-                    # ── Проверка дублей по тексту + автору ────────────────
                     fp = _post_fingerprint(text, author_name)
                     if fp in published_fingerprints:
-                        log.info(
-                            f'[{_acc}][дубль ⛔] {chat_name} — текст+автор уже публиковались'
-                        )
+                        log.info(f'[{_acc}][дубль ⛔] {chat_name}')
                         return
                     published_fingerprints.append(fp)
 
-                    # ── Авто-публикация от имени канала ───────────────────
+                    # Скачиваем фото если есть
+                    photos = await _download_photos(_client, [msg])
+
                     await loop.run_in_executor(_executor, _write_post, ss, post)
-                    log.info(f'[авто ✅ скор:{score} {_acc}] {chat_name} → {link}')
+                    log.info(f'[авто ✅ скор:{score} фото:{len(photos)} {_acc}] {chat_name} → {link}')
                     if dest_chat:
-                        ok = await _publish_post(_client, post, dest_chat)
+                        ok = await _publish_post(_client, post, dest_chat, photos)
                         if not ok:
                             log.error(f'[{_acc}] Публикация не удалась: {link}')
                 else:
-                    # ── На модерацию: карточка с inline-кнопками ───────────
-                    log.info(
-                        f'[модерация ⏳ скор:{score}/{threshold} {_acc}] '
-                        f'{chat_name} → {link}'
-                    )
+                    log.info(f'[модерация ⏳ скор:{score}/{threshold} {_acc}] {chat_name} → {link}')
                     bot_msg_id = 0
                     if tg_token and moderator:
                         bot_msg_id = await loop.run_in_executor(
                             _executor, _send_moderation_card, post, tg_token, moderator,
                         )
-
                     post['bot_message_id'] = bot_msg_id
-
-                    # Кладём в очередь для _bot_polling_loop
+                    post['grouped_msgs']   = [msg]  # для скачивания при одобрении
                     pend_key = f'{raw_id}:{msg.id}'
                     pending_moderation[pend_key] = post
-
-                    await loop.run_in_executor(
-                        _executor, _write_rejected, ss, post, bot_msg_id
-                    )
+                    await loop.run_in_executor(_executor, _write_rejected, ss, post, bot_msg_id)
 
             except Exception as e:
                 log.error(f'[{_acc}] Ошибка обработки сообщения: {e}', exc_info=True)
