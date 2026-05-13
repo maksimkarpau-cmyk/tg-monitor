@@ -493,6 +493,9 @@ def _send_moderation_card(post: dict, token: str, moderator_chat_id: str) -> int
         else:
             author_str = post['author_name']
 
+    # Ключ для pending_moderation
+    pend_key = f'{post["src_chat_id"]}:{post["src_msg_id"]}'
+
     lines = [
         f'📢 <b>Источник:</b>',
         f'{post["chat_name"]}',
@@ -511,8 +514,8 @@ def _send_moderation_card(post: dict, token: str, moderator_chat_id: str) -> int
         'disable_web_page_preview': True,
         'reply_markup': {
             'inline_keyboard': [[
-                {'text': '✅ Отправить', 'callback_data': f'approve:{post["link"]}'},
-                {'text': '❌ Пропустить', 'callback_data': f'skip:{post["link"]}'},
+                {'text': '✅ Отправить', 'callback_data': f'approve:{pend_key}'},
+                {'text': '❌ Пропустить', 'callback_data': f'skip:{pend_key}'},
             ]]
         },
     })
