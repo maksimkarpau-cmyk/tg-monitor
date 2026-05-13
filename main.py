@@ -60,16 +60,17 @@ log = logging.getLogger(__name__)
 # ── Глобальное состояние ───────────────────────────────────────────────────────
 
 state = {
-    'tg_token':          '',
-    'score_threshold':   7,
-    'min_length':        20,
-    'moderator_chat_id': '',
-    'dest_chat_id':      '',
-    'scoring_rules':     [],   # [{'category': str, 'weight': int, 'keywords': [str]}]
-    'minus_words':       [],   # [str]
-    'watched_ids':       set(),
-    'id_to_meta':        {},   # {id_variant: {chat_name, username, entity_id}}
-    'username_to_meta':  {},
+    'tg_token':             '',
+    'score_threshold':      7,   # минимальный скор для авто-публикации
+    'moderation_threshold': 4,   # минимальный скор для отправки на модерацию
+    'min_length':           20,
+    'moderator_chat_id':    '',
+    'dest_chat_id':         '',
+    'scoring_rules':        [],
+    'minus_words':          [],
+    'watched_ids':          set(),
+    'id_to_meta':           {},
+    'username_to_meta':     {},
 }
 
 # Часовой пояс для записи в таблицу (GMT+3)
@@ -114,11 +115,12 @@ def _read_settings(ss):
         def val(row_idx):
             return str(data[row_idx][1]).strip() if len(data) > row_idx and len(data[row_idx]) > 1 else ''
         return {
-            'tg_token':          val(1),
-            'score_threshold':   int(val(2) or 7),
-            'min_length':        int(val(3) or 20),
-            'moderator_chat_id': val(4),
-            'dest_chat_id':      val(5),
+            'tg_token':             val(1),
+            'score_threshold':      int(val(2) or 7),
+            'min_length':           int(val(3) or 20),
+            'moderator_chat_id':    val(4),
+            'dest_chat_id':         val(5),
+            'moderation_threshold': int(val(6) or 4),
         }
     except Exception as e:
         log.error('Ошибка чтения настроек: ' + str(e))
@@ -828,11 +830,12 @@ async def _settings_reload_loop(clients: dict, ss):
 
             if new_settings:
                 state.update({
-                    'tg_token':          new_settings['tg_token'],
-                    'score_threshold':   new_settings['score_threshold'],
-                    'min_length':        new_settings['min_length'],
-                    'moderator_chat_id': new_settings['moderator_chat_id'],
-                    'dest_chat_id':      new_settings['dest_chat_id'],
+                    'tg_token':             new_settings['tg_token'],
+                    'score_threshold':      new_settings['score_threshold'],
+                    'moderation_threshold': new_settings['moderation_threshold'],
+                    'min_length':           new_settings['min_length'],
+                    'moderator_chat_id':    new_settings['moderator_chat_id'],
+                    'dest_chat_id':         new_settings['dest_chat_id'],
                 })
             if new_rules    is not None: state['scoring_rules'] = new_rules
             if new_minus    is not None: state['minus_words']   = new_minus
@@ -843,7 +846,8 @@ async def _settings_reload_loop(clients: dict, ss):
                 f'Настройки применены | каналов: {len(state["watched_ids"])} | '
                 f'правил: {len(state["scoring_rules"])} | '
                 f'минус-слов: {len(state["minus_words"])} | '
-                f'порог: {state["score_threshold"]}'
+                f'публикация: {state["score_threshold"]} | '
+                f'модерация: {state["moderation_threshold"]}'
             )
         except Exception as e:
             log.error('Ошибка перезагрузки настроек: ' + str(e))
@@ -1026,19 +1030,29 @@ async def main():
         return
 
     state.update({
-        'tg_token':          settings['tg_token'],
-        'score_threshold':   settings['score_threshold'],
-        'min_length':        settings['min_length'],
-        'moderator_chat_id': settings['moderator_chat_id'],
-        'dest_chat_id':      settings['dest_chat_id'],
-        'scoring_rules':     rules,
-        'minus_words':       minus,
+        'tg_token':             settings['tg_token'],
+        'score_threshold':      settings['score_threshold'],
+        'moderation_threshold': settings['moderation_threshold'],
+        'min_length':           settings['min_length'],
+        'moderator_chat_id':    settings['moderator_chat_id'],
+        'dest_chat_id':         settings['dest_chat_id'],
+        'scoring_rules':        rules,
+        'minus_words':          minus,
     })
     log.info(
-        f'Настройки загружены | порог: {state["score_threshold"]} | '
+        f'Настройки загружены | публикация: {state["score_threshold"]} | '
+        f'модерация: {state["moderation_threshold"]} | '
         f'мин.длина: {state["min_length"]} | '
         f'правил скоринга: {len(rules)} | минус-слов: {len(minus)}'
     )
+
+    # ── Сбрасываем webhook — иначе getUpdates вернёт 409 ──────────────────
+    if state['tg_token']:
+        await loop.run_in_executor(
+            _executor, _tg_request,
+            state['tg_token'], 'deleteWebhook', {'drop_pending_updates': False}
+        )
+        log.info('Webhook сброшен')
 
     # ── Telegram клиенты ───────────────────────────────────────────────────
     clients: dict[str, TelegramClient] = {}
@@ -1131,7 +1145,7 @@ async def main():
             return
 
         score = _calc_score(text, state['scoring_rules'])
-        if score == 0:
+        if score < state['moderation_threshold']:
             return
 
         try:
@@ -1252,8 +1266,9 @@ async def main():
                     return
 
                 score = _calc_score(text, state['scoring_rules'])
-                if score == 0:
-                    log.debug(f'[{_acc}][скор=0] {meta["chat_name"]} — выброс')
+                mod_threshold = state['moderation_threshold']
+                if score < mod_threshold:
+                    log.debug(f'[{_acc}][скор:{score}<{mod_threshold}] {meta["chat_name"]} — выброс')
                     return
 
                 chat      = await event.get_chat()
