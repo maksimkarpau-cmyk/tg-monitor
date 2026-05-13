@@ -795,9 +795,6 @@ async def _update_watched_chats(clients: dict, channels: list, ss):
                 new_ids.add(vid)
                 new_id_meta[vid] = meta
             state['username_to_meta'][username] = meta
-            # Сохраняем кеш сразу после нового резолва — чтобы не терять при рестарте
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(_executor, _write_entity_cache, ss)
         await asyncio.sleep(0.8)
 
     added   = new_ids - state['watched_ids']
@@ -808,6 +805,10 @@ async def _update_watched_chats(clients: dict, channels: list, ss):
     log.info(f'Каналов в watched_ids: {len(new_ids)} (ключей в id_to_meta: {len(new_id_meta)})')
     if added:   log.info(f'Добавлено ID-ключей: {len(added)}')
     if removed: log.info(f'Убрано ID-ключей: {len(removed)}')
+
+    # Пишем кеш один раз в конце — избегаем 429 от Sheets API
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(_executor, _write_entity_cache, ss)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
