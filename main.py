@@ -501,13 +501,30 @@ def _text_to_html(text: str, entities) -> str:
 
 def _has_minus_word(text: str, minus_words: list) -> bool:
     lower = text.lower()
-    return any(w in lower for w in minus_words if w)
+    for w in minus_words:
+        if not w:
+            continue
+        # Для коротких слов (до 4 букв) — точное совпадение по границе слова
+        if len(w) <= 4:
+            if re.search(r'(?<![а-яёa-z])' + re.escape(w) + r'(?![а-яёa-z])', lower):
+                return True
+        else:
+            # Для длинных — подстрока достаточно точна
+            if w in lower:
+                return True
+    return False
     
 def _find_minus_word(text: str, minus_words: list) -> str | None:
     lower = text.lower()
     for w in minus_words:
-        if w and w in lower:
-            return w
+        if not w:
+            continue
+        if len(w) <= 4:
+            if re.search(r'(?<![а-яёa-z])' + re.escape(w) + r'(?![а-яёa-z])', lower):
+                return w
+        else:
+            if w in lower:
+                return w
     return None
 
 def _calc_score(text: str, rules: list) -> int:
