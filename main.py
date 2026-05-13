@@ -375,6 +375,77 @@ def _get_author_info(msg):
     except Exception:
         return '', ''
 
+def _text_to_html(text: str, entities) -> str:
+    """Конвертирует Telegram message entities в HTML-теги."""
+    if not entities or not text:
+        return text or ''
+
+    from telethon.tl.types import (
+        MessageEntityBold, MessageEntityItalic, MessageEntityUnderline,
+        MessageEntityStrike, MessageEntityCode, MessageEntityPre,
+        MessageEntityTextUrl, MessageEntityUrl, MessageEntityMention,
+    )
+
+    # Работаем с байтами чтобы правильно считать offsets (Telegram даёт UTF-16 offsets)
+    encoded = text.encode('utf-16-le')
+
+    # Собираем теги: {pos: [open_tags], pos: [close_tags]}
+    opens = {}
+    closes = {}
+
+    for ent in sorted(entities, key=lambda e: (e.offset, -e.length)):
+        o = ent.offset * 2  # utf-16-le: каждый символ = 2 байта
+        c = (ent.offset + ent.length) * 2
+
+        if isinstance(ent, MessageEntityBold):
+            tag_o, tag_c = '<b>', '</b>'
+        elif isinstance(ent, MessageEntityItalic):
+            tag_o, tag_c = '<i>', '</i>'
+        elif isinstance(ent, MessageEntityUnderline):
+            tag_o, tag_c = '<u>', '</u>'
+        elif isinstance(ent, MessageEntityStrike):
+            tag_o, tag_c = '<s>', '</s>'
+        elif isinstance(ent, MessageEntityCode):
+            tag_o, tag_c = '<code>', '</code>'
+        elif isinstance(ent, MessageEntityPre):
+            tag_o, tag_c = '<pre>', '</pre>'
+        elif isinstance(ent, MessageEntityTextUrl):
+            url = ent.url.replace('"', '&quot;')
+            tag_o, tag_c = f'<a href="{url}">', '</a>'
+        elif isinstance(ent, MessageEntityUrl):
+            raw_url = encoded[o:c].decode('utf-16-le')
+            url = raw_url.replace('"', '&quot;')
+            tag_o, tag_c = f'<a href="{url}">', '</a>'
+        elif isinstance(ent, MessageEntityMention):
+            mention = encoded[o:c].decode('utf-16-le')
+            username = mention.lstrip('@')
+            tag_o, tag_c = f'<a href="https://t.me/{username}">', '</a>'
+        else:
+            continue
+
+        opens.setdefault(o, []).append(tag_o)
+        closes.setdefault(c, []).insert(0, tag_c)
+
+    # Собираем результат посимвольно
+    result = []
+    i = 0
+    while i <= len(encoded) - 1 or i in opens or i in closes:
+        for tag in closes.get(i, []):
+            result.append(tag)
+        for tag in opens.get(i, []):
+            result.append(tag)
+        if i < len(encoded) - 1:
+            char = encoded[i:i+2].decode('utf-16-le')
+            # Экранируем HTML-спецсимволы в обычном тексте
+            char = char.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            result.append(char)
+        i += 2
+
+    # Закрывающие теги в самом конце
+    for tag in closes.get(len(encoded), []):
+        result.append(tag)
+
+    return ''.join(result)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Фильтрация и скоринг
@@ -421,31 +492,33 @@ def _tg_request(token: str, method: str, payload: dict, timeout: int = 10) -> di
 
 
 def _send_moderation_card(post: dict, token: str, moderator_chat_id: str) -> int:
-    """
-    Отправляет карточку модерации в чат модератора с inline-кнопками ✅/❌.
-    Возвращает message_id бота (для привязки callback).
-    """
-    lines = [
-        f'⚠️ <b>Пост не прошёл скоринг</b> (скор: {post["score"]}/{state["score_threshold"]})',
-        f'📢 <b>{post["chat_name"]}</b>',
-    ]
+    author_str = '—'
     if post['author_name']:
-        author = post['author_name']
         if post['author_link']:
-            author += f' — {post["author_link"]}'
-        lines.append(f'👤 {author}')
-    lines += ['', post['text'][:1000], '', f'🔗 {post["link"]}']
+            author_str = f'<a href="{post["author_link"]}">{post["author_name"]}</a>'
+        else:
+            author_str = post['author_name']
+
+    lines = [
+        f'📢 <b>Источник:</b>',
+        f'{post["chat_name"]}',
+        f'👤 <b>Автор:</b>',
+        f'{author_str}',
+        '',
+        post['html_text'][:3500],
+        '',
+        f'🔗 <a href="{post["link"]}">Открыть сообщение</a>',
+    ]
 
     result = _tg_request(token, 'sendMessage', {
-        'chat_id':    moderator_chat_id,
-        'text':       '\n'.join(lines)[:4096],
+        'chat_id': moderator_chat_id,
+        'text': '\n'.join(lines)[:4096],
         'parse_mode': 'HTML',
+        'disable_web_page_preview': True,
         'reply_markup': {
             'inline_keyboard': [[
-                # callback_data содержит bot_message_id — он ещё неизвестен здесь,
-                # поэтому кладём уникальный ключ на основе chat+msg
-                {'text': '✅ Опубликовать', 'callback_data': f'approve:{post["src_chat_id"]}:{post["src_msg_id"]}'},
-                {'text': '❌ Пропустить',   'callback_data': f'skip:{post["src_chat_id"]}:{post["src_msg_id"]}'},
+                {'text': '✅ Отправить', 'callback_data': f'approve:{post["link"]}'},
+                {'text': '❌ Пропустить', 'callback_data': f'skip:{post["link"]}'},
             ]]
         },
     })
@@ -1129,15 +1202,18 @@ async def main():
         if meta is None:
             return
 
-        # Берём текст из первого сообщения с непустым текстом
+         # Берём текст из первого сообщения с непустым текстом
         text = ''
+        text_entities = None
         for m in msgs:
             t = m.text or m.message or ''
             if hasattr(m, 'caption') and m.caption:
                 t = m.caption
             if t.strip():
                 text = t
+                text_entities = m.entities
                 break
+        html_text = _text_to_html(text, text_entities)
 
         if _has_minus_word(text, state['minus_words']):
             return
@@ -1164,6 +1240,7 @@ async def main():
             'author_link': author_link,
             'link':        link,
             'text':        text,
+            'html_text':   html_text,
             'score':       score,
             'account':     _acc,
             'src_chat_id': raw_id,
@@ -1253,9 +1330,8 @@ async def main():
                 text = msg.text or msg.message or ''
                 if hasattr(msg, 'caption') and msg.caption:
                     text = msg.caption
-                # Только нормализуем множественные пробелы в пределах строки,
-                # но НЕ трогаем переносы строк
                 text = re.sub(r'[^\S\n]+', ' ', text).strip()
+                html_text = _text_to_html(text, msg.entities)
 
                 if _has_minus_word(text, state['minus_words']):
                     log.debug(f'[{_acc}][минус-слово] {meta["chat_name"]} — выброс')
@@ -1283,6 +1359,7 @@ async def main():
                     'author_link': author_link,
                     'link':        link,
                     'text':        text,
+                    'html_text':   html_text,
                     'score':       score,
                     'account':     _acc,
                     'src_chat_id': raw_id,
