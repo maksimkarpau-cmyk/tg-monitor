@@ -8,7 +8,6 @@ TG Parser v3 — один аккаунт (или два), скоринг + мо�
   и приёма callback_query от кнопок ✅/❌.
 - Весь основной поток (main + хендлер) — в одном месте.
 """
-
 import asyncio
 import base64
 import io
