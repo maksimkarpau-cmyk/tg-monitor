@@ -1498,6 +1498,7 @@ async def main():
                     alt = int(s[3:]) if s.startswith('100') and len(s) > 12 else int('100' + s)
                     meta = id_to_meta.get(alt)
 
+                log.info(f'[{_acc}] abs_id={abs_id}, meta={meta}, id_to_meta_keys={sorted(id_to_meta.keys())[:20]}')
                 if meta is None:
                     log.debug(f'[{_acc}] Пропущен chat_id={raw_id} (abs={abs_id}) — не в списке')
                     return
