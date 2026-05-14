@@ -665,26 +665,30 @@ def _post_fingerprint(text: str, author_name: str) -> str:
 
 
 def _build_caption(post: dict) -> str:
-    link        = post['link']
     chat_name   = post.get('chat_name', '') or 'Источник'
-    source_html = f'<a href="{link}">{chat_name}</a>'
-
+    link        = post['link']
     author_name = post.get('author_name', '').strip()
     author_link = post.get('author_link', '').strip()
 
+    source_line = f'Источник: <a href="{link}">{chat_name}</a>'
+
     if author_name and author_link:
-        footer = f'{source_html} · <a href="{author_link}">{author_name}</a>'
+        author_line = f'Автор: <a href="{author_link}">{author_name}</a>'
     elif author_name:
-        footer = f'{source_html} · {author_name}'
+        author_line = f'Автор: {author_name}'
     else:
-        footer = source_html
+        author_line = ''
 
     text = post['text']
-    max_text = 1024 - len(footer) - 4
+    header = source_line + '\n' + author_line if author_line else source_line
+    max_text = 4096 - len(header) - 3
     if len(text) > max_text:
         text = text[:max_text].rstrip() + '…'
 
-    return f'{text}\n\n{footer}'
+    if author_line:
+        return f'{source_line}\n{author_line}\n\n{text}'
+    else:
+        return f'{source_line}\n\n{text}'
 
 
 # ── Bot API helpers для отправки медиа ────────────────────────────────────────
@@ -1347,6 +1351,10 @@ async def main():
                     if not ok:
                         metrics['errors'] += 1
             else:
+                fp = _post_fingerprint(text, author_name)
+                if fp in published_fingerprints:
+                    log.info(f'[{_acc}][альбом дубль модерация ⛔] {chat_name}')
+                    return
                 log.info(f'[модерация альбом ⏳ скор:{score}/{threshold} {_acc}] {chat_name} → {link}')
                 post['grouped_refs'] = [(m.chat_id, m.id) for m in msgs]
                 bot_msg_id = 0
@@ -1357,6 +1365,7 @@ async def main():
                 post['bot_message_id'] = bot_msg_id
                 pend_key = f'{raw_id}:{first.id}'
                 pending_moderation[pend_key] = post
+                published_fingerprints.append(fp)
                 metrics['moderated'] += 1
                 await _safe_sheets_retry(_write_rejected, ss, post, bot_msg_id)
 
@@ -1483,6 +1492,11 @@ async def main():
                             metrics['errors'] += 1
                             log.error(f'[{_acc}] Публикация не удалась: {link}')
                 else:
+                    # Проверка дубля перед модерацией
+                    fp = _post_fingerprint(text, author_name)
+                    if fp in published_fingerprints:
+                        log.info(f'[{_acc}][дубль модерация ⛔] {chat_name}')
+                        return
                     log.info(f'[модерация ⏳ скор:{score}/{threshold} {_acc}] {chat_name} → {link}')
                     bot_msg_id = 0
                     if tg_token and moderator:
@@ -1493,6 +1507,7 @@ async def main():
                     post['grouped_refs']   = [(msg.chat_id, msg.id)]
                     pend_key = f'{raw_id}:{msg.id}'
                     pending_moderation[pend_key] = post
+                    published_fingerprints.append(fp)
                     metrics['moderated'] += 1
                     await _safe_sheets_retry(_write_rejected, ss, post, bot_msg_id)
 
