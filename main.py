@@ -826,7 +826,7 @@ async def _publish_post(client: TelegramClient, post: dict,
                 entity=int(dest_chat),
                 message=caption,
                 parse_mode='html',
-                link_preview=False,
+                link_preview=True,
             )
         return True
     except Exception as e:
