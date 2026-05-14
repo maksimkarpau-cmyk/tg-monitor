@@ -1434,8 +1434,6 @@ async def main():
                 if hasattr(msg, 'caption') and msg.caption:
                     text = msg.caption
                 text = re.sub(r'[^\S\n]+', ' ', text).strip()
-                # ВРЕМЕННЫЙ ЛОГ — убрать после диагностики
-                log.info(f'[{_acc}][текст] {meta["chat_name"]} | score_would_be:{_calc_score(text, scoring_rules)} | minus:{_has_minus_word(text, minus_words)} | len:{len(text)} | {repr(text[:120])}')
                 html_text = _text_to_html(text, msg.entities)
 
                 minus_hit = _find_minus_word(text, minus_words)
