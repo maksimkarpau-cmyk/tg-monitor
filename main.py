@@ -686,9 +686,9 @@ def _build_caption(post: dict) -> str:
         text = text[:max_text].rstrip() + '…'
 
     if author_line:
-        return f'{source_line}\n{author_line}\n\n{text}'
+        return f'{author_line}\n{source_line}\n\n{text}'  # автор первый
     else:
-        return f'{source_line}\n\n{text}'
+        return f'{source_line}\n\n{text}'  # нет автора — источник первый
 
 
 # ── Bot API helpers для отправки медиа ────────────────────────────────────────
