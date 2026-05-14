@@ -70,7 +70,7 @@ state = {
 TZ_OFFSET_HOURS = 3
 
 seen_ids: deque = deque(maxlen=2000)
-published_fingerprints: deque = deque(maxlen=500)
+published_fingerprints: deque = deque(maxlen=10000)
 pending_moderation: dict = {}
 
 _executor = ThreadPoolExecutor(max_workers=EXECUTOR_WORKERS)
@@ -663,6 +663,20 @@ def _post_fingerprint(text: str, author_name: str) -> str:
     author_key = re.sub(r'\s+', '', author_name.lower())
     return f'{author_key}|{norm}'
 
+def _load_published_fingerprints(ss) -> set:
+    try:
+        data = ss.worksheet('Посты').get_all_values()
+        result = set()
+        for row in data[1:]:
+            text        = row[5].strip() if len(row) > 5 else ''
+            author_name = row[2].strip() if len(row) > 2 else ''
+            if text:
+                result.add(_post_fingerprint(text, author_name))
+        log.info(f'Загружено {len(result)} fingerprint-ов из листа Посты')
+        return result
+    except Exception as e:
+        log.error(f'Ошибка загрузки fingerprints: {e}', exc_info=True)
+        return set()
 
 def _build_caption(post: dict) -> str:
     chat_name   = post.get('chat_name', '') or 'Источник'
@@ -1177,6 +1191,11 @@ async def main():
     rules    = await _safe_sheets_result(_read_scoring_rules, ss)
     minus    = await _safe_sheets_result(_read_minus_words,   ss)
     channels = await _safe_sheets_result(_read_channels,      ss)
+    
+    initial_fps = await _safe_sheets_result(_load_published_fingerprints, ss)
+    for fp in initial_fps:
+        published_fingerprints.append(fp)
+    log.info(f'Дедупликация: загружено {len(initial_fps)} записей из Посты')
 
     if not settings:
         log.error('Не удалось прочитать настройки — проверьте лист «Настройки»')
@@ -1365,7 +1384,6 @@ async def main():
                 post['bot_message_id'] = bot_msg_id
                 pend_key = f'{raw_id}:{first.id}'
                 pending_moderation[pend_key] = post
-                published_fingerprints.append(fp)
                 metrics['moderated'] += 1
                 await _safe_sheets_retry(_write_rejected, ss, post, bot_msg_id)
 
@@ -1505,7 +1523,6 @@ async def main():
                     post['grouped_refs']   = [(msg.chat_id, msg.id)]
                     pend_key = f'{raw_id}:{msg.id}'
                     pending_moderation[pend_key] = post
-                    published_fingerprints.append(fp)
                     metrics['moderated'] += 1
                     await _safe_sheets_retry(_write_rejected, ss, post, bot_msg_id)
 
