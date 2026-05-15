@@ -1,5 +1,5 @@
 """
-TG Parser v3 — один аккаунт (или два), скоринг + модерация через inline-кнопки.
+TG Parser v3 — один аккаунт (или два), скоринг + AI-модерация через Gemini.
 """
 import asyncio
 import base64
@@ -41,6 +41,9 @@ SPREADSHEET_ID         = os.environ.get('SPREADSHEET_ID', '')
 GOOGLE_CREDENTIALS_B64 = os.environ.get('GOOGLE_CREDENTIALS_BASE64', '')
 SETTINGS_RELOAD_SEC    = int(os.environ.get('SETTINGS_RELOAD_INTERVAL', '300'))
 EXECUTOR_WORKERS       = int(os.environ.get('EXECUTOR_WORKERS', '8'))
+
+# ── НОВОЕ: Gemini API ──────────────────────────────────────────────────────────
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
 
 # ── Логирование ────────────────────────────────────────────────────────────────
 
@@ -251,6 +254,24 @@ def _write_rejected(ss, post, bot_message_id):
         raise
 
 
+# ── НОВОЕ: запись постов отклонённых AI ───────────────────────────────────────
+
+def _write_ai_rejected(ss, post: dict, ai_decision: str):
+    """Пишет в лист 'Отклонено ИИ' для аудита решений модели."""
+    try:
+        ss.worksheet('Отклонено ИИ').append_row([
+            _local_dt(post['date']).strftime('%Y-%m-%d %H:%M:%S'),
+            post['chat_name'],
+            post['link'],
+            post['text'],
+            post['score'],
+            ai_decision,
+            post['account'],
+        ], value_input_option='USER_ENTERED')
+    except Exception as e:
+        log.error(f'Ошибка записи в Отклонено ИИ: {e}', exc_info=True)
+
+
 def _write_log(ss, level, message, account=''):
     try:
         safe = str(message)
@@ -353,26 +374,15 @@ def _extract_username(raw: str):
 
 
 def _all_id_variants(entity_id: int) -> list:
-    """
-    Возвращает все варианты ID по которым может прийти event.chat_id.
-
-    Telethon возвращает entity.id без префикса 100 (например 1592206426),
-    но event.chat_id приходит с префиксом -100 (например -1001592206426).
-    abs(event.chat_id) = 1001592206426 — это и есть ключ поиска.
-
-    Поэтому храним ОБА варианта: короткий и длинный (с префиксом 100).
-    """
     eid = abs(entity_id)
     variants: set[int] = {eid}
     s = str(eid)
     try:
         if s.startswith('100') and len(s) > 12:
-            # уже длинный — добавляем короткий
             short = int(s[3:])
             if short > 0:
                 variants.add(short)
         else:
-            # короткий — добавляем длинный
             variants.add(int('100' + s))
     except ValueError:
         pass
@@ -380,7 +390,6 @@ def _all_id_variants(entity_id: int) -> list:
 
 
 def _meta_by_abs_id(id_to_meta: dict, abs_id: int):
-    """Ищет meta по abs_id, пробуя оба варианта ID."""
     meta = id_to_meta.get(abs_id)
     if meta is not None:
         return meta
@@ -504,16 +513,15 @@ def _has_minus_word(text: str, minus_words: list) -> bool:
     for w in minus_words:
         if not w:
             continue
-        # Для коротких слов (до 4 букв) — точное совпадение по границе слова
         if len(w) <= 4:
             if re.search(r'(?<![а-яёa-z])' + re.escape(w) + r'(?![а-яёa-z])', lower):
                 return True
         else:
-            # Для длинных — подстрока достаточно точна
             if w in lower:
                 return True
     return False
-    
+
+
 def _find_minus_word(text: str, minus_words: list) -> str | None:
     lower = text.lower()
     for w in minus_words:
@@ -526,6 +534,7 @@ def _find_minus_word(text: str, minus_words: list) -> str | None:
             if w in lower:
                 return w
     return None
+
 
 def _calc_score(text: str, rules: list) -> int:
     lower = text.lower()
@@ -541,6 +550,149 @@ def _calc_score(text: str, rules: list) -> int:
                     total += rule['weight']
                     break
     return total
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# НОВОЕ: AI-модерация через Gemini
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _ai_moderate(text: str, score: int) -> str:
+    """
+    Отправляет текст поста в Gemini для классификации.
+
+    Возвращает одно из трёх значений:
+      'approve' — публиковать автоматически
+      'skip'    — отклонить, записать в лист 'Отклонено ИИ'
+      'manual'  — отправить на ручную модерацию в бот
+
+    Если GEMINI_API_KEY не задан или произошла ошибка сети —
+    возвращает 'manual', чтобы пост не потерялся.
+    """
+    if not GEMINI_API_KEY:
+        log.warning('[gemini] GEMINI_API_KEY не задан — пропускаем AI, решение: manual')
+        return 'manual'
+
+    prompt = f"""Ты модератор доски объявлений по аренде и продаже недвижимости в Батуми (Грузия).
+
+Твоя задача: определить, является ли сообщение реальным запросом человека или агента, который ИЩЕТ жильё (хочет снять, купить или арендовать).
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ОДОБРЯЙ (approve):
+
+• Прямой запрос от физлица — «ищу», «сниму», «куплю», «арендую» + хоть один параметр (тип жилья, район, срок, бюджет, количество комнат). Даже очень короткий:
+  «Сниму орби до конца мая», «Ищу студию в аренду на год», «Куплю 1+1 до 80 000$»
+
+• Агент или риелтор ищет жильё ДЛЯ КЛИЕНТА — это реальный спрос:
+  «Ищу для клиента 1+1», «Сниму клиенту студию», «Куплю для клиента 2+1 в каркасе»
+
+• Человек ищет соседа, подселение или совместную аренду:
+  «Ищу девушку на подселение», «Ищу соседа для совместного съёма»
+
+• Ищут коммерческую недвижимость — помещение, офис, кабинет:
+  «Ищу помещение 50–100 м² под аренду», «Ищу квартиру под офис»
+
+• Ищут жильё только в городе Батуми
+
+• Ищут риелтора/агента с целью найти жильё для себя или клиента:
+  «Ищу надёжного агента по недвижимости», «Ищу риелтора — есть предложение»
+
+• Ищут нестандартное жильё — вилла, дом, таунхаус, этаж в доме, комната, дача, коттедж
+
+• Срочный выкуп квартиры «для себя» или «для клиента» по фиксированной цене
+
+• Запрос с параметрами на нескольких языках (русский + грузинский + английский) — одобряй
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ОТКЛОНЯЙ (skip):
+
+• Объявление от собственника или агента о СДАЧЕ или ПРОДАЖЕ жилья:
+  «Сдаю квартиру», «Продаю студию», «Есть варианты», «Предлагаем апартаменты»
+  ИСКЛЮЧЕНИЕ: «Сдача в аренду ... я ищу клиента» — это агент ищет арендатора, не покупателя → skip
+
+• Реклама агентства или риелторских услуг без конкретного запроса на жильё:
+  «Наша риелтор Вероника, узнайте у неё», «Мы занимаемся посуточной арендой»
+
+• Сообщение не связано с недвижимостью вообще:
+  «Ищу официанта», «Хочу купить пишущую машинку», «Ищу друзей из других стран»
+
+• Туристические советы, вопросы об отдыхе без запроса жилья:
+  «Хочется на магнитные пески и в домик в горах, есть информация о коттеджах?»
+
+• Вопрос об оформлении документов при переезде без конкретного запроса жилья:
+  «Нужно ли по приезду в Батуми где-то оформлять документы?»
+
+• Ответ или комментарий в ветке без запроса жилья:
+  «Я живу сейчас в орби и ищу квартиру в другом месте» (без параметров — просто реплика)
+  «А вообще реально снять квартиру в нормальном районе за 400–500$?» (риторический вопрос)
+
+• Флуд, жалоба на засорение чата, поздравления, посторонние обсуждения
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+РУЧНАЯ МОДЕРАЦИЯ (manual):
+
+• Текст неоднозначный — невозможно уверенно определить, ищет человек жильё или что-то другое
+• Запрос есть, но не хватает информации для уверенного решения
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ВАЖНЫЕ ПРАВИЛА:
+
+1. Короткий текст — НЕ причина для отклонения. «Ищу студию в аренду на год» → approve.
+2. Агент пишет «для клиента» или «клиенту» → это запрос спроса → approve.
+3. Если человек называет бюджет, район, тип жилья или срок — это реальный запрос → approve.
+4. Слово «сдача» или «сдаю» от лица собственника/агента → skip.
+5. Не жилая недвижимость (помещение, офис, кабинет) — всё равно approve, это тоже спрос.
+
+Скоринг системы для этого поста: {score} (выше = больше ключевых слов поиска жилья)
+
+Отвечай СТРОГО одним словом без пробелов и знаков препинания: approve, skip или manual.
+
+Текст сообщения:
+{text[:2000]}"""
+    loop = asyncio.get_event_loop()
+
+    def _call_gemini() -> str:
+        url = (
+            'https://generativelanguage.googleapis.com/v1beta/models/'
+            f'gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}'
+        )
+        payload = json.dumps({
+            'contents': [{'parts': [{'text': prompt}]}],
+            'generationConfig': {
+                'maxOutputTokens': 10,
+                'temperature': 0,
+            },
+        }).encode('utf-8')
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={'Content-Type': 'application/json'},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                answer = (
+                    data['candidates'][0]['content']['parts'][0]['text']
+                    .strip().lower()
+                )
+                log.debug(f'[gemini] raw answer: {repr(answer)}')
+                if 'approve' in answer:
+                    return 'approve'
+                if 'skip' in answer:
+                    return 'skip'
+                return 'manual'
+        except urllib.error.HTTPError as e:
+            # 429 = превышен лимит запросов — не теряем пост
+            body = ''
+            try:
+                body = e.read().decode('utf-8')
+            except Exception:
+                pass
+            log.warning(f'[gemini] HTTP {e.code}: {body[:200]} — решение: manual')
+            return 'manual'
+        except Exception as e:
+            log.warning(f'[gemini] ошибка запроса: {e} — решение: manual')
+            return 'manual'
+
+    return await loop.run_in_executor(_executor, _call_gemini)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -663,6 +815,7 @@ def _post_fingerprint(text: str, author_name: str) -> str:
     author_key = re.sub(r'\s+', '', author_name.lower())
     return f'{author_key}|{norm}'
 
+
 def _load_published_fingerprints(ss) -> set:
     try:
         data = ss.worksheet('Посты').get_all_values()
@@ -677,6 +830,7 @@ def _load_published_fingerprints(ss) -> set:
     except Exception as e:
         log.error(f'Ошибка загрузки fingerprints: {e}', exc_info=True)
         return set()
+
 
 def _build_caption(post: dict) -> str:
     chat_name   = post.get('chat_name', '') or 'Источник'
@@ -700,9 +854,9 @@ def _build_caption(post: dict) -> str:
         text = text[:max_text].rstrip() + '…'
 
     if author_line:
-        return f'{author_line}\n{source_line}\n\n{text}'  # автор первый
+        return f'{author_line}\n{source_line}\n\n{text}'
     else:
-        return f'{source_line}\n\n{text}'  # нет автора — источник первый
+        return f'{source_line}\n\n{text}'
 
 
 # ── Bot API helpers для отправки медиа ────────────────────────────────────────
@@ -924,7 +1078,6 @@ async def _update_watched_chats(clients: dict, channels: list, ss):
     if added:   log.info(f'Добавлено ID-ключей: {len(added)}')
     if removed: log.info(f'Убрано ID-ключей: {len(removed)}')
 
-    # Логируем несколько ключей для диагностики
     sample = sorted(new_id_meta.keys())[:6]
     log.info(f'Пример ключей id_to_meta: {sample}')
 
@@ -1191,7 +1344,7 @@ async def main():
     rules    = await _safe_sheets_result(_read_scoring_rules, ss)
     minus    = await _safe_sheets_result(_read_minus_words,   ss)
     channels = await _safe_sheets_result(_read_channels,      ss)
-    
+
     initial_fps = await _safe_sheets_result(_load_published_fingerprints, ss)
     for fp in initial_fps:
         published_fingerprints.append(fp)
@@ -1217,6 +1370,12 @@ async def main():
         f'мин.длина: {state["min_length"]} | '
         f'правил: {len(rules)} | минус-слов: {len(minus)}'
     )
+
+    # ── НОВОЕ: логируем статус Gemini при старте ───────────────────────────
+    if GEMINI_API_KEY:
+        log.info(f'Gemini AI: ключ задан, AI-модерация активна')
+    else:
+        log.warning('Gemini AI: GEMINI_API_KEY не задан — все посты пойдут в ручную модерацию')
 
     # ── Сбрасываем webhook ─────────────────────────────────────────────────
     if state['tg_token']:
@@ -1354,13 +1513,23 @@ async def main():
 
             metrics['processed'] += 1
 
-            if score >= threshold:
-                fp = _post_fingerprint(text, author_name)
-                if fp in published_fingerprints:
-                    log.info(f'[{_acc}][альбом дубль ⛔] {chat_name}')
-                    return
-                published_fingerprints.append(fp)
+            # ── НОВОЕ: AI-модерация для альбомов ──────────────────────────
+            fp = _post_fingerprint(text, author_name)
+            if fp in published_fingerprints:
+                log.info(f'[{_acc}][альбом дубль ⛔] {chat_name}')
+                return
 
+            ai_decision = await _ai_moderate(text, score)
+            log.info(f'[{_acc}][альбом AI:{ai_decision} скор:{score}] {chat_name} → {link}')
+
+            if ai_decision == 'skip':
+                # Отклонено AI — пишем в аудит-лист, больше ничего не делаем
+                await _safe_sheets_retry(_write_ai_rejected, ss, post, ai_decision)
+                return
+
+            if ai_decision == 'approve' or score >= threshold:
+                # AI одобрил, или скор высокий + AI не уверен — публикуем
+                published_fingerprints.append(fp)
                 photos = await _download_photos(_client, msgs)
                 await _safe_sheets_retry(_write_post, ss, post)
                 metrics['published'] += 1
@@ -1369,23 +1538,21 @@ async def main():
                     ok = await _publish_post(_client, post, dest_chat, photos)
                     if not ok:
                         metrics['errors'] += 1
-            else:
-                fp = _post_fingerprint(text, author_name)
-                if fp in published_fingerprints:
-                    log.info(f'[{_acc}][альбом дубль модерация ⛔] {chat_name}')
-                    return
-                log.info(f'[модерация альбом ⏳ скор:{score}/{threshold} {_acc}] {chat_name} → {link}')
-                post['grouped_refs'] = [(m.chat_id, m.id) for m in msgs]
-                bot_msg_id = 0
-                if tg_token and moderator:
-                    bot_msg_id = await loop.run_in_executor(
-                        _executor, _send_moderation_card, post, tg_token, moderator,
-                    )
-                post['bot_message_id'] = bot_msg_id
-                pend_key = f'{raw_id}:{first.id}'
-                pending_moderation[pend_key] = post
-                metrics['moderated'] += 1
-                await _safe_sheets_retry(_write_rejected, ss, post, bot_msg_id)
+                return
+
+            # ai_decision == 'manual' и score < threshold — отправляем на ручную модерацию
+            log.info(f'[модерация альбом ⏳ скор:{score}/{threshold} {_acc}] {chat_name} → {link}')
+            post['grouped_refs'] = [(m.chat_id, m.id) for m in msgs]
+            bot_msg_id = 0
+            if tg_token and moderator:
+                bot_msg_id = await loop.run_in_executor(
+                    _executor, _send_moderation_card, post, tg_token, moderator,
+                )
+            post['bot_message_id'] = bot_msg_id
+            pend_key = f'{raw_id}:{first.id}'
+            pending_moderation[pend_key] = post
+            metrics['moderated'] += 1
+            await _safe_sheets_retry(_write_rejected, ss, post, bot_msg_id)
 
         except Exception as e:
             metrics['errors'] += 1
@@ -1398,7 +1565,6 @@ async def main():
             try:
                 msg = event.message
 
-                # ── FIX: пропускаем служебные и пустые сообщения ──────────
                 if isinstance(msg, (MessageService, MessageEmpty)):
                     return
                 if getattr(msg, 'action', None) is not None:
@@ -1418,12 +1584,10 @@ async def main():
                     dest_chat     = state['dest_chat_id']
                     moderator     = state['moderator_chat_id']
 
-                # ── FIX: используем _meta_by_abs_id вместо ручного alt ────
                 meta = _meta_by_abs_id(id_to_meta, abs_id)
                 if meta is None:
-                    return  # не наш канал, молча пропускаем
+                    return
 
-                # ── Дедупликация ───────────────────────────────────────────
                 dedup_key = (raw_id, msg.id)
                 if dedup_key in seen_ids:
                     return
@@ -1491,13 +1655,23 @@ async def main():
 
                 metrics['processed'] += 1
 
-                if score >= threshold:
-                    fp = _post_fingerprint(text, author_name)
-                    if fp in published_fingerprints:
-                        log.info(f'[{_acc}][дубль ⛔] {chat_name}')
-                        return
-                    published_fingerprints.append(fp)
+                # ── НОВОЕ: AI-модерация для всех постов прошедших фильтры ──
+                fp = _post_fingerprint(text, author_name)
+                if fp in published_fingerprints:
+                    log.info(f'[{_acc}][дубль ⛔] {chat_name}')
+                    return
 
+                ai_decision = await _ai_moderate(text, score)
+                log.info(f'[{_acc}][AI:{ai_decision} скор:{score}] {chat_name} → {link}')
+
+                if ai_decision == 'skip':
+                    # Отклонено AI — пишем в аудит-лист, больше ничего не делаем
+                    await _safe_sheets_retry(_write_ai_rejected, ss, post, ai_decision)
+                    return
+
+                if ai_decision == 'approve' or score >= threshold:
+                    # AI одобрил, или скор высокий + AI не уверен — публикуем
+                    published_fingerprints.append(fp)
                     photos = await _download_photos(_client, [msg])
                     await _safe_sheets_retry(_write_post, ss, post)
                     metrics['published'] += 1
@@ -1506,25 +1680,21 @@ async def main():
                         ok = await _publish_post(_client, post, dest_chat, photos)
                         if not ok:
                             metrics['errors'] += 1
-                            log.error(f'[{_acc}] Публикация не удалась: {link}')
-                else:
-                    # Проверка дубля перед модерацией
-                    fp = _post_fingerprint(text, author_name)
-                    if fp in published_fingerprints:
-                        log.info(f'[{_acc}][дубль модерация ⛔] {chat_name}')
-                        return
-                    log.info(f'[модерация ⏳ скор:{score}/{threshold} {_acc}] {chat_name} → {link}')
-                    bot_msg_id = 0
-                    if tg_token and moderator:
-                        bot_msg_id = await loop.run_in_executor(
-                            _executor, _send_moderation_card, post, tg_token, moderator,
-                        )
-                    post['bot_message_id'] = bot_msg_id
-                    post['grouped_refs']   = [(msg.chat_id, msg.id)]
-                    pend_key = f'{raw_id}:{msg.id}'
-                    pending_moderation[pend_key] = post
-                    metrics['moderated'] += 1
-                    await _safe_sheets_retry(_write_rejected, ss, post, bot_msg_id)
+                    return
+
+                # ai_decision == 'manual' и score < threshold — отправляем на ручную модерацию
+                log.info(f'[модерация ⏳ скор:{score}/{threshold} {_acc}] {chat_name} → {link}')
+                bot_msg_id = 0
+                if tg_token and moderator:
+                    bot_msg_id = await loop.run_in_executor(
+                        _executor, _send_moderation_card, post, tg_token, moderator,
+                    )
+                post['bot_message_id'] = bot_msg_id
+                post['grouped_refs']   = [(msg.chat_id, msg.id)]
+                pend_key = f'{raw_id}:{msg.id}'
+                pending_moderation[pend_key] = post
+                metrics['moderated'] += 1
+                await _safe_sheets_retry(_write_rejected, ss, post, bot_msg_id)
 
             except Exception as e:
                 metrics['errors'] += 1
