@@ -653,7 +653,7 @@ async def _ai_moderate(text: str, score: int) -> str:
     def _call_gemini() -> str:
         url = (
             'https://generativelanguage.googleapis.com/v1beta/models/'
-            f'gemini-2.5-flash-preview-05-20:generateContent?key={GEMINI_API_KEY}'
+            f'gemini-2.0-flash-lite-05-20:generateContent?key={GEMINI_API_KEY}'
         )
         payload = json.dumps({
             'contents': [{'parts': [{'text': prompt}]}],
