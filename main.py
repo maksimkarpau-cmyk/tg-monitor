@@ -669,10 +669,12 @@ async def _ai_moderate(text: str, score: int) -> str:
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
-                answer = (
-                    data['candidates'][0]['content']['parts'][0]['text']
-                    .strip().lower()
-                )
+                parts = data['candidates'][0]['content']['parts']
+                answer = ''
+                for part in parts:
+                    if 'text' in part:
+                        answer = part['text'].strip().lower()
+                        break
                 log.debug(f'[gemini] raw answer: {repr(answer)}')
                 if 'approve' in answer:
                     return 'approve'
