@@ -1,5 +1,6 @@
 """
 TG Parser v3 — один аккаунт (или два), скоринг + AI-модерация через Gemini.
+Маршрутизация: approve_private → dest_chat_id, approve_agent → dest_chat_id_agent.
 """
 import asyncio
 import base64
@@ -41,9 +42,7 @@ SPREADSHEET_ID         = os.environ.get('SPREADSHEET_ID', '')
 GOOGLE_CREDENTIALS_B64 = os.environ.get('GOOGLE_CREDENTIALS_BASE64', '')
 SETTINGS_RELOAD_SEC    = int(os.environ.get('SETTINGS_RELOAD_INTERVAL', '300'))
 EXECUTOR_WORKERS       = int(os.environ.get('EXECUTOR_WORKERS', '8'))
-
-# ── НОВОЕ: Gemini API ──────────────────────────────────────────────────────────
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+GEMINI_API_KEY         = os.environ.get('GEMINI_API_KEY', '')
 
 # ── Логирование ────────────────────────────────────────────────────────────────
 
@@ -63,6 +62,7 @@ state = {
     'min_length':           20,
     'moderator_chat_id':    '',
     'dest_chat_id':         '',
+    'dest_chat_id_agent':   '',
     'scoring_rules':        [],
     'minus_words':          [],
     'watched_ids':          set(),
@@ -146,10 +146,11 @@ def _read_settings(ss):
         return {
             'tg_token':             val(1),
             'score_threshold':      int(val(2) or 7),
-            'min_length':           int(val(3) or 20),
-            'moderator_chat_id':    val(4),
-            'dest_chat_id':         val(5),
-            'moderation_threshold': int(val(6) or 4),
+            'moderation_threshold': int(val(3) or 3),
+            'min_length':           int(val(4) or 20),
+            'moderator_chat_id':    val(5),
+            'dest_chat_id':         val(6),
+            'dest_chat_id_agent':   val(7),
         }
     except Exception as e:
         log.error('Ошибка чтения настроек: ' + str(e), exc_info=True)
@@ -231,6 +232,7 @@ def _write_post(ss, post):
             post['text'],
             post['score'],
             post['account'],
+            post.get('ai_decision', ''),
         ], value_input_option='USER_ENTERED')
     except Exception as e:
         log.error('Ошибка записи поста: ' + str(e), exc_info=True)
@@ -254,10 +256,7 @@ def _write_rejected(ss, post, bot_message_id):
         raise
 
 
-# ── НОВОЕ: запись постов отклонённых AI ───────────────────────────────────────
-
 def _write_ai_rejected(ss, post: dict, ai_decision: str):
-    """Пишет в лист 'Отклонено ИИ' для аудита решений модели."""
     try:
         ss.worksheet('Отклонено ИИ').append_row([
             _local_dt(post['date']).strftime('%Y-%m-%d %H:%M:%S'),
@@ -553,70 +552,86 @@ def _calc_score(text: str, rules: list) -> int:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# НОВОЕ: AI-модерация через Gemini
+# AI-модерация через Gemini
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _ai_moderate(text: str, score: int) -> str:
     """
     Отправляет текст поста в Gemini для классификации.
 
-    Возвращает одно из трёх значений:
-      'approve' — публиковать автоматически
-      'skip'    — отклонить, записать в лист 'Отклонено ИИ'
-      'manual'  — отправить на ручную модерацию в бот
+    Возвращает одно из четырёх значений:
+      'approve_private' — частный человек ищет жильё → публикуем в основной канал
+      'approve_agent'   — агент/риелтор ищет для клиента → публикуем в агентский канал
+      'skip'            — отклонить (предложение о сдаче/продаже, спам, не по теме)
+      'manual'          — отправить на ручную модерацию в бот
 
-    Если GEMINI_API_KEY не задан или произошла ошибка сети —
-    возвращает 'manual', чтобы пост не потерялся.
+    Если GEMINI_API_KEY не задан или ошибка сети — возвращает 'manual'.
     """
     if not GEMINI_API_KEY:
-        log.warning('[gemini] GEMINI_API_KEY не задан — пропускаем AI, решение: manual')
+        log.warning('[gemini] GEMINI_API_KEY не задан — решение: manual')
         return 'manual'
 
     prompt = f"""Ты модератор доски объявлений по аренде и продаже недвижимости в Батуми (Грузия).
 
-Твоя задача: определить, является ли сообщение реальным запросом человека или агента, который ИЩЕТ жильё (хочет снять, купить или арендовать).
+Твоя задача: определить, является ли сообщение реальным запросом на поиск жилья, и если да — определить тип: от частного лица или от агента/риелтора.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ОДОБРЯЙ (approve):
+ЧАСТНЫЙ ЗАПРОС → approve_private
 
-• Прямой запрос от физлица — «ищу», «сниму», «куплю», «арендую» + хоть один параметр (тип жилья, район, срок, бюджет, количество комнат). Даже очень короткий:
+Обычный человек ищет жильё для себя, семьи или друга (не профессиональный агент):
+
+• Прямой запрос — «ищу», «сниму», «куплю», «арендую» + хоть один параметр (тип жилья, район, срок, бюджет, количество комнат). Даже очень короткий:
   «Сниму орби до конца мая», «Ищу студию в аренду на год», «Куплю 1+1 до 80 000$»
 
-• Агент или риелтор ищет жильё ДЛЯ КЛИЕНТА — это реальный спрос:
-  «Ищу для клиента 1+1», «Сниму клиенту студию», «Куплю для клиента 2+1 в каркасе»
+• Описывает себя лично: «мы с женой», «без вредных привычек», «работаем удалённо», «пара без животных»
 
-• Ищут коммерческую недвижимость — помещение, офис, кабинет:
+• Ищет нестандартное жильё для себя — вилла, дом, таунхаус, этаж в доме, комната, дача, коттедж
+
+• Ищет коммерческую недвижимость для себя — помещение, офис, кабинет, бьюти-кабинет, коворкинг:
   «Ищу помещение 50–100 м² под аренду», «Ищу квартиру под офис»
 
-• Ищут жильё только в городе Батуми и его окрестностях (Кабулети, Гонио, Квариати, Сарпи, Махинджаури, Букнари, Чакви, Цихисдзири)
+• Срочный выкуп квартиры «для себя» по фиксированной цене
 
-• Ищут риелтора/агента с целью найти жильё для себя или клиента:
+• Ищет риелтора/агента, чтобы найти жильё для себя:
   «Ищу надёжного агента по недвижимости», «Ищу риелтора — есть предложение»
 
-• Ищут нестандартное жильё — вилла, дом, таунхаус, этаж в доме, комната, дача, коттедж
-
-• Срочный выкуп квартиры «для себя» или «для клиента» по фиксированной цене
-
-• Ответ или комментарий в ветке без запроса жилья:
-  «Я живу сейчас в орби и ищу квартиру в другом месте» (без параметров — просто реплика)
+• Ответ или комментарий в ветке без чётко выраженного запроса — просто реплика:
+  «Я живу сейчас в орби и ищу квартиру в другом месте»
   «А вообще реально снять квартиру в нормальном районе за 400–500$?» (риторический вопрос)
 
-• Запрос с параметрами на нескольких языках (русский + грузинский + английский) — одобряй
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+АГЕНТСКИЙ ЗАПРОС → approve_agent
+
+Риелтор, агент или управляющая компания ищет жильё профессионально:
+
+• Явные маркеры поиска для клиента: «для клиента», «клиенту», «под клиента», «сниму клиенту»:
+  «Ищу для клиента 1+1», «Сниму клиенту студию», «Куплю для клиента 2+1 в каркасе»
+
+• Профессиональная самоидентификация в тексте: «риелтор», «агент», «недвижимость», «broker», «estate», «realty», «управляющая компания»
+
+• Профессиональные формулировки: «сотрудничаю», «гарантирую быструю сдачу», «работаю по договору с описью», «договор + опись»
+
+• Ищет сразу несколько объектов в одном посте с разными параметрами:
+  «1+1 за 600$, 2+1 за 900$» — скорее всего агент с несколькими клиентами
+
+• Срочный выкуп «для клиента» по фиксированной цене
+
+• Предлагает сотрудничество собственникам прямо в посте о поиске
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ОТКЛОНЯЙ (skip):
+ОТКЛОНИТЬ → skip
 
 • Объявление от собственника или агента о СДАЧЕ или ПРОДАЖЕ жилья:
   «Сдаю квартиру», «Продаю студию», «Есть варианты», «Предлагаем апартаменты»
-  ИСКЛЮЧЕНИЕ: «Сдача в аренду ... я ищу клиента» — это агент ищет арендатора, не покупателя → skip
+  ИСКЛЮЧЕНИЕ: «Сдача в аренду ... я ищу клиента» — это агент ищет арендатора → skip
 
-• Реклама агентства или риелторских услуг без конкретного запроса на жильё:
+• Реклама агентства или риелторских услуг без конкретного запроса на поиск жилья:
   «Наша риелтор Вероника, узнайте у неё», «Мы занимаемся посуточной арендой»
 
 • Сообщение не связано с недвижимостью вообще:
   «Ищу официанта», «Хочу купить пишущую машинку», «Ищу друзей из других стран»
 
-• Туристические советы, вопросы об отдыхе без запроса жилья:
+• Туристические советы, вопросы об отдыхе без конкретного запроса жилья:
   «Хочется на магнитные пески и в домик в горах, есть информация о коттеджах?»
 
 • Человек ищет соседа, подселение или совместную аренду:
@@ -625,29 +640,35 @@ async def _ai_moderate(text: str, score: int) -> str:
 • Вопрос об оформлении документов при переезде без конкретного запроса жилья:
   «Нужно ли по приезду в Батуми где-то оформлять документы?»
 
-• Флуд, жалоба на засорение чата, поздравления, посторонние обсуждения
+• Флуд, жалобы на засорение чата, поздравления, посторонние обсуждения
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-РУЧНАЯ МОДЕРАЦИЯ (manual):
+РУЧНАЯ МОДЕРАЦИЯ → manual
 
 • Текст неоднозначный — невозможно уверенно определить, ищет человек жильё или что-то другое
 • Запрос есть, но не хватает информации для уверенного решения
+• Невозможно определить: частное лицо или агент
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ВАЖНЫЕ ПРАВИЛА:
 
-1. Короткий текст — НЕ причина для отклонения. «Ищу студию в аренду на год» → approve.
-2. Агент пишет «для клиента» или «клиенту» → это запрос спроса → approve.
-3. Если человек называет бюджет, район, тип жилья или срок — это реальный запрос → approve.
+1. Короткий текст — НЕ причина для отклонения или manual. «Сниму орби до конца мая» → approve_private.
+2. Агент пишет «для клиента» или «клиенту» → approve_agent, даже если пост короткий.
+3. Если человек называет бюджет, район, тип жилья или срок — это реальный запрос → approve_*.
 4. Слово «сдача» или «сдаю» от лица собственника/агента → skip.
-5. Не жилая недвижимость (помещение, офис, кабинет) — всё равно approve, это тоже спрос.
+5. Коммерческая недвижимость (помещение, офис, кабинет) — всё равно approve, это тоже спрос.
+6. Ищут жильё только в Батуми и окрестностях (Кабулети, Гонио, Квариати, Сарпи, Махинджаури, Букнари, Чакви, Цихисдзири) — одобряй.
+7. Запросы на нескольких языках (русский + грузинский + английский) — одобряй.
+8. Человек ищет сразу несколько объектов с разными бюджетами в одном посте → скорее всего approve_agent.
 
 Скоринг системы для этого поста: {score} (выше = больше ключевых слов поиска жилья)
 
-Отвечай СТРОГО одним словом без пробелов и знаков препинания: approve, skip или manual.
+Отвечай СТРОГО одним словом без пробелов и знаков препинания:
+approve_private, approve_agent, skip или manual.
 
 Текст сообщения:
 {text[:2000]}"""
+
     loop = asyncio.get_event_loop()
 
     def _call_gemini() -> str:
@@ -671,9 +692,9 @@ async def _ai_moderate(text: str, score: int) -> str:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
                 candidate = data.get('candidates', [{}])[0]
-                content = candidate.get('content', {})
-                parts = content.get('parts', [])
-                answer = ''
+                content   = candidate.get('content', {})
+                parts     = content.get('parts', [])
+                answer    = ''
                 for part in parts:
                     if part.get('type') == 'thought':
                         continue
@@ -682,13 +703,17 @@ async def _ai_moderate(text: str, score: int) -> str:
                         answer = text_val.strip().lower()
                         break
                 log.debug(f'[gemini] raw answer: {repr(answer)}')
-                if 'approve' in answer:
-                    return 'approve'
+                if 'approve_agent' in answer:
+                    return 'approve_agent'
+                if 'approve_private' in answer:
+                    return 'approve_private'
+                # Проверяем просто 'approve' после того как исключили оба специфичных варианта
+                if answer == 'approve':
+                    return 'approve_private'
                 if 'skip' in answer:
                     return 'skip'
                 return 'manual'
         except urllib.error.HTTPError as e:
-            # 429 = превышен лимит запросов — не теряем пост
             body = ''
             try:
                 body = e.read().decode('utf-8')
@@ -701,6 +726,13 @@ async def _ai_moderate(text: str, score: int) -> str:
             return 'manual'
 
     return await loop.run_in_executor(_executor, _call_gemini)
+
+
+def _pick_dest_chat(ai_decision: str) -> str:
+    """Возвращает ID канала для публикации на основе решения AI."""
+    if ai_decision == 'approve_agent' and state.get('dest_chat_id_agent'):
+        return state['dest_chat_id_agent']
+    return state['dest_chat_id']
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -753,6 +785,10 @@ def _get_updates(token: str, offset: int, timeout: int = 30) -> list:
 
 
 def _send_moderation_card(post: dict, token: str, moderator_chat_id: str) -> int:
+    """
+    Отправляет карточку поста на ручную модерацию.
+    Три кнопки: частный / агент / пропустить.
+    """
     author_str = '—'
     if post['author_name']:
         if post['author_link']:
@@ -779,7 +815,8 @@ def _send_moderation_card(post: dict, token: str, moderator_chat_id: str) -> int
         'disable_web_page_preview': True,
         'reply_markup': {
             'inline_keyboard': [[
-                {'text': '✅ Отправить', 'callback_data': f'approve:{pend_key}'},
+                {'text': '👤 Частный',  'callback_data': f'approve_private:{pend_key}'},
+                {'text': '🏢 Агент',    'callback_data': f'approve_agent:{pend_key}'},
                 {'text': '❌ Пропустить', 'callback_data': f'skip:{pend_key}'},
             ]]
         },
@@ -1093,6 +1130,84 @@ async def _update_watched_chats(clients: dict, channels: list, ss):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Вспомогательная функция публикации с AI-маршрутизацией
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _process_and_publish(
+    post: dict,
+    client: TelegramClient,
+    msgs_for_photos: list,
+    ss,
+    acc: str,
+):
+    """
+    Единая точка AI-модерации и публикации для одиночных сообщений и альбомов.
+    Убирает дублирование логики между двумя хендлерами.
+    """
+    loop = asyncio.get_event_loop()
+
+    async with _state_lock:
+        threshold     = state['score_threshold']
+        mod_threshold = state['moderation_threshold']
+        tg_token      = state['tg_token']
+        moderator     = state['moderator_chat_id']
+
+    text        = post['text']
+    score       = post['score']
+    author_name = post['author_name']
+    chat_name   = post['chat_name']
+    link        = post['link']
+
+    # Дедупликация
+    fp = _post_fingerprint(text, author_name)
+    if fp in published_fingerprints:
+        log.info(f'[{acc}][дубль ⛔] {chat_name}')
+        return
+
+    # AI-модерация
+    ai_decision = await _ai_moderate(text, score)
+    log.info(f'[{acc}][AI:{ai_decision} скор:{score}] {chat_name} → {link}')
+
+    post['ai_decision'] = ai_decision
+
+    # Отклонено AI
+    if ai_decision == 'skip':
+        await _safe_sheets_retry(_write_ai_rejected, ss, post, ai_decision)
+        return
+
+    # Автопубликация: AI одобрил ИЛИ скор достаточно высокий
+    if ai_decision in ('approve_private', 'approve_agent') or score >= threshold:
+        published_fingerprints.append(fp)
+        photos  = await _download_photos(client, msgs_for_photos)
+        target  = _pick_dest_chat(ai_decision)
+
+        await _safe_sheets_retry(_write_post, ss, post)
+        metrics['published'] += 1
+        log.info(
+            f'[авто ✅ скор:{score} фото:{len(photos)} {acc}] '
+            f'{chat_name} → {link} (канал: {target or "не задан"})'
+        )
+        if target:
+            ok = await _publish_post(client, post, target, photos or None)
+            if not ok:
+                metrics['errors'] += 1
+        return
+
+    # Ручная модерация: AI не уверен И скор ниже порога
+    log.info(f'[модерация ⏳ скор:{score}/{threshold} {acc}] {chat_name} → {link}')
+    bot_msg_id = 0
+    if tg_token and moderator:
+        bot_msg_id = await loop.run_in_executor(
+            _executor, _send_moderation_card, post, tg_token, moderator,
+        )
+    post['bot_message_id'] = bot_msg_id
+    pend_key = f'{post["src_chat_id"]}:{post["src_msg_id"]}'
+    pending_moderation[pend_key] = post
+    metrics['moderated'] += 1
+    await _safe_sheets_retry(_write_rejected, ss, post, bot_msg_id)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Фоновые задачи
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1115,6 +1230,7 @@ async def _settings_reload_loop(clients: dict, ss):
                         'min_length':           new_settings['min_length'],
                         'moderator_chat_id':    new_settings['moderator_chat_id'],
                         'dest_chat_id':         new_settings['dest_chat_id'],
+                        'dest_chat_id_agent':   new_settings.get('dest_chat_id_agent', ''),
                     })
             if new_rules is not None:
                 async with _state_lock:
@@ -1129,8 +1245,10 @@ async def _settings_reload_loop(clients: dict, ss):
                 f'Настройки применены | каналов: {len(state["watched_ids"])} | '
                 f'правил: {len(state["scoring_rules"])} | '
                 f'минус-слов: {len(state["minus_words"])} | '
-                f'публикация: {state["score_threshold"]} | '
-                f'модерация: {state["moderation_threshold"]}'
+                f'порог публикации: {state["score_threshold"]} | '
+                f'порог модерации: {state["moderation_threshold"]} | '
+                f'канал частных: {state["dest_chat_id"]} | '
+                f'канал агентов: {state["dest_chat_id_agent"]}'
             )
         except Exception as e:
             log.error('Ошибка перезагрузки настроек: ' + str(e), exc_info=True)
@@ -1170,6 +1288,7 @@ async def _bot_polling_loop(clients: dict, ss):
     def _first_client() -> TelegramClient | None:
         return next(iter(clients.values()), None)
 
+    # Ждём освобождения слота getUpdates при старте
     token = state['tg_token']
     if token:
         for attempt in range(10):
@@ -1191,7 +1310,6 @@ async def _bot_polling_loop(clients: dict, ss):
         async with _state_lock:
             token     = state['tg_token']
             moderator = state['moderator_chat_id']
-            dest_chat = state['dest_chat_id']
 
         if not token:
             await asyncio.sleep(5)
@@ -1231,8 +1349,10 @@ async def _bot_polling_loop(clients: dict, ss):
             from_id = cq.get('from', {}).get('id', '')
             msg_id  = cq.get('message', {}).get('message_id', 0)
 
+            # Формат callback_data: 'action:src_chat_id:src_msg_id'
+            # action может быть: approve_private, approve_agent, skip
             parts = data.split(':', 2)
-            if len(parts) != 3 or parts[0] not in ('approve', 'skip'):
+            if len(parts) != 3 or parts[0] not in ('approve_private', 'approve_agent', 'skip'):
                 await loop.run_in_executor(
                     _executor, _answer_callback, token, cq_id, '⚠️ Неизвестная команда'
                 )
@@ -1253,9 +1373,16 @@ async def _bot_polling_loop(clients: dict, ss):
                 )
                 continue
 
-            if action == 'approve':
+            if action in ('approve_private', 'approve_agent'):
                 client = _first_client()
-                if client and dest_chat:
+
+                async with _state_lock:
+                    dest_private = state['dest_chat_id']
+                    dest_agent   = state.get('dest_chat_id_agent', '')
+
+                target = dest_agent if (action == 'approve_agent' and dest_agent) else dest_private
+
+                if client and target:
                     try:
                         fp = _post_fingerprint(post['text'], post['author_name'])
                         if fp in published_fingerprints:
@@ -1275,21 +1402,28 @@ async def _bot_polling_loop(clients: dict, ss):
                         grouped_msgs = await _fetch_messages_by_refs(client, refs) if refs else []
                         photos       = await _download_photos(client, grouped_msgs) if grouped_msgs else []
 
-                        ok = await _publish_post(client, post, dest_chat, photos or None)
+                        post['ai_decision'] = action
+                        ok = await _publish_post(client, post, target, photos or None)
+
                         if ok:
                             published_fingerprints.append(fp)
                             metrics['published'] += 1
-                            log.info(f'[модерация ✅ фото:{len(photos)}] {post["chat_name"]} → {post["link"]}')
+                            label = '👤 частный' if action == 'approve_private' else '🏢 агент'
+                            log.info(
+                                f'[модерация ✅ {label} фото:{len(photos)}] '
+                                f'{post["chat_name"]} → {post["link"]}'
+                            )
                             await _safe_sheets_retry(_write_post, ss, post)
                             await _safe_sheets(_update_rejected_status, ss,
-                                               post.get('bot_message_id', 0), 'одобрено')
+                                               post.get('bot_message_id', 0), f'одобрено ({label})')
                             await loop.run_in_executor(
-                                _executor, _answer_callback, token, cq_id, '✅ Опубликовано!'
+                                _executor, _answer_callback, token, cq_id,
+                                f'✅ Опубликовано ({label})!'
                             )
                             await loop.run_in_executor(
                                 _executor, _edit_message_reply_markup,
                                 token, moderator, msg_id,
-                                f'✅ Опубликовано модератором {from_id}'
+                                f'✅ {label.capitalize()} — опубликовано модератором {from_id}'
                             )
                         else:
                             metrics['errors'] += 1
@@ -1306,7 +1440,7 @@ async def _bot_polling_loop(clients: dict, ss):
                 else:
                     await loop.run_in_executor(
                         _executor, _answer_callback, token, cq_id,
-                        '⚠️ Нет клиента или dest_chat_id'
+                        '⚠️ Нет клиента или целевого канала'
                     )
 
             elif action == 'skip':
@@ -1369,21 +1503,24 @@ async def main():
         'min_length':           settings['min_length'],
         'moderator_chat_id':    settings['moderator_chat_id'],
         'dest_chat_id':         settings['dest_chat_id'],
+        'dest_chat_id_agent':   settings.get('dest_chat_id_agent', ''),
         'scoring_rules':        rules,
         'minus_words':          minus,
     })
     log.info(
-        f'Настройки загружены | публикация: {state["score_threshold"]} | '
-        f'модерация: {state["moderation_threshold"]} | '
+        f'Настройки загружены | '
+        f'порог публикации: {state["score_threshold"]} | '
+        f'порог модерации: {state["moderation_threshold"]} | '
         f'мин.длина: {state["min_length"]} | '
-        f'правил: {len(rules)} | минус-слов: {len(minus)}'
+        f'правил: {len(rules)} | минус-слов: {len(minus)} | '
+        f'канал частных: {state["dest_chat_id"]} | '
+        f'канал агентов: {state["dest_chat_id_agent"] or "не задан"}'
     )
 
-    # ── НОВОЕ: логируем статус Gemini при старте ───────────────────────────
     if GEMINI_API_KEY:
-        log.info(f'Gemini AI: ключ задан, AI-модерация активна')
+        log.info('Gemini AI: ключ задан, AI-модерация активна (4 класса)')
     else:
-        log.warning('Gemini AI: GEMINI_API_KEY не задан — все посты пойдут в ручную модерацию')
+        log.warning('Gemini AI: GEMINI_API_KEY не задан — все посты идут в ручную модерацию')
 
     # ── Сбрасываем webhook ─────────────────────────────────────────────────
     if state['tg_token']:
@@ -1433,7 +1570,7 @@ async def main():
     )
 
     # ══════════════════════════════════════════════════════════════════════
-    # Буфер альбомов и хендлер
+    # Буфер альбомов и хендлеры
     # ══════════════════════════════════════════════════════════════════════
 
     album_buffer: dict = {}
@@ -1459,16 +1596,13 @@ async def main():
                 scoring_rules = list(state['scoring_rules'])
                 min_length    = state['min_length']
                 mod_threshold = state['moderation_threshold']
-                threshold     = state['score_threshold']
-                tg_token      = state['tg_token']
-                dest_chat     = state['dest_chat_id']
-                moderator     = state['moderator_chat_id']
 
             meta = _meta_by_abs_id(id_to_meta, abs_id)
             if meta is None:
                 log.info(f'[{_acc}][альбом] abs_id={abs_id} не в списке каналов — пропуск')
                 return
 
+            # Берём текст из первого сообщения альбома с непустым текстом
             text = ''
             text_entities = None
             for m in msgs:
@@ -1480,12 +1614,11 @@ async def main():
                     text_entities = m.entities
                     break
             html_text = _text_to_html(text, text_entities)
-
             chat_name = meta.get('chat_name', str(abs_id))
 
             minus_hit = _find_minus_word(text, minus_words)
             if minus_hit:
-                log.info(f'[{_acc}][альбом минус "{minus_hit}"] {chat_name} | {repr(text[:80])}')
+                log.info(f'[{_acc}][альбом минус "{minus_hit}"] {chat_name}')
                 return
             if len(text) < min_length:
                 log.info(f'[{_acc}][альбом короткий {len(text)}<{min_length}] {chat_name}')
@@ -1505,62 +1638,23 @@ async def main():
             author_name, author_link = _get_author_info(first)
 
             post = {
-                'date':        first.date.replace(tzinfo=None),
-                'chat_name':   chat_name,
-                'author_name': author_name,
-                'author_link': author_link,
-                'link':        link,
-                'text':        text,
-                'html_text':   html_text,
-                'score':       score,
-                'account':     _acc,
-                'src_chat_id': raw_id,
-                'src_msg_id':  first.id,
-                'added_at':    time.time(),
+                'date':         first.date.replace(tzinfo=None),
+                'chat_name':    chat_name,
+                'author_name':  author_name,
+                'author_link':  author_link,
+                'link':         link,
+                'text':         text,
+                'html_text':    html_text,
+                'score':        score,
+                'account':      _acc,
+                'src_chat_id':  raw_id,
+                'src_msg_id':   first.id,
+                'grouped_refs': [(m.chat_id, m.id) for m in msgs],
+                'added_at':     time.time(),
             }
 
             metrics['processed'] += 1
-
-            # ── НОВОЕ: AI-модерация для альбомов ──────────────────────────
-            fp = _post_fingerprint(text, author_name)
-            if fp in published_fingerprints:
-                log.info(f'[{_acc}][альбом дубль ⛔] {chat_name}')
-                return
-
-            ai_decision = await _ai_moderate(text, score)
-            log.info(f'[{_acc}][альбом AI:{ai_decision} скор:{score}] {chat_name} → {link}')
-
-            if ai_decision == 'skip':
-                # Отклонено AI — пишем в аудит-лист, больше ничего не делаем
-                await _safe_sheets_retry(_write_ai_rejected, ss, post, ai_decision)
-                return
-
-            if ai_decision == 'approve' or score >= threshold:
-                # AI одобрил, или скор высокий + AI не уверен — публикуем
-                published_fingerprints.append(fp)
-                photos = await _download_photos(_client, msgs)
-                await _safe_sheets_retry(_write_post, ss, post)
-                metrics['published'] += 1
-                log.info(f'[авто альбом ✅ скор:{score} фото:{len(photos)} {_acc}] {chat_name} → {link}')
-                if dest_chat:
-                    ok = await _publish_post(_client, post, dest_chat, photos)
-                    if not ok:
-                        metrics['errors'] += 1
-                return
-
-            # ai_decision == 'manual' и score < threshold — отправляем на ручную модерацию
-            log.info(f'[модерация альбом ⏳ скор:{score}/{threshold} {_acc}] {chat_name} → {link}')
-            post['grouped_refs'] = [(m.chat_id, m.id) for m in msgs]
-            bot_msg_id = 0
-            if tg_token and moderator:
-                bot_msg_id = await loop.run_in_executor(
-                    _executor, _send_moderation_card, post, tg_token, moderator,
-                )
-            post['bot_message_id'] = bot_msg_id
-            pend_key = f'{raw_id}:{first.id}'
-            pending_moderation[pend_key] = post
-            metrics['moderated'] += 1
-            await _safe_sheets_retry(_write_rejected, ss, post, bot_msg_id)
+            await _process_and_publish(post, _client, msgs, ss, _acc)
 
         except Exception as e:
             metrics['errors'] += 1
@@ -1587,10 +1681,6 @@ async def main():
                     scoring_rules = list(state['scoring_rules'])
                     min_length    = state['min_length']
                     mod_threshold = state['moderation_threshold']
-                    threshold     = state['score_threshold']
-                    tg_token      = state['tg_token']
-                    dest_chat     = state['dest_chat_id']
-                    moderator     = state['moderator_chat_id']
 
                 meta = _meta_by_abs_id(id_to_meta, abs_id)
                 if meta is None:
@@ -1607,7 +1697,7 @@ async def main():
                 grouped_id = getattr(msg, 'grouped_id', None)
                 if grouped_id:
                     if grouped_id not in album_buffer:
-                        handle = loop.call_later(
+                        handle = asyncio.get_event_loop().call_later(
                             1.5, lambda gid=grouped_id: asyncio.ensure_future(
                                 _flush_album(gid, _acc, _client)
                             )
@@ -1658,51 +1748,12 @@ async def main():
                     'account':     _acc,
                     'src_chat_id': raw_id,
                     'src_msg_id':  msg.id,
+                    'grouped_refs': [(msg.chat_id, msg.id)],
                     'added_at':    time.time(),
                 }
 
                 metrics['processed'] += 1
-
-                # ── НОВОЕ: AI-модерация для всех постов прошедших фильтры ──
-                fp = _post_fingerprint(text, author_name)
-                if fp in published_fingerprints:
-                    log.info(f'[{_acc}][дубль ⛔] {chat_name}')
-                    return
-
-                ai_decision = await _ai_moderate(text, score)
-                log.info(f'[{_acc}][AI:{ai_decision} скор:{score}] {chat_name} → {link}')
-
-                if ai_decision == 'skip':
-                    # Отклонено AI — пишем в аудит-лист, больше ничего не делаем
-                    await _safe_sheets_retry(_write_ai_rejected, ss, post, ai_decision)
-                    return
-
-                if ai_decision == 'approve' or score >= threshold:
-                    # AI одобрил, или скор высокий + AI не уверен — публикуем
-                    published_fingerprints.append(fp)
-                    photos = await _download_photos(_client, [msg])
-                    await _safe_sheets_retry(_write_post, ss, post)
-                    metrics['published'] += 1
-                    log.info(f'[авто ✅ скор:{score} фото:{len(photos)} {_acc}] {chat_name} → {link}')
-                    if dest_chat:
-                        ok = await _publish_post(_client, post, dest_chat, photos)
-                        if not ok:
-                            metrics['errors'] += 1
-                    return
-
-                # ai_decision == 'manual' и score < threshold — отправляем на ручную модерацию
-                log.info(f'[модерация ⏳ скор:{score}/{threshold} {_acc}] {chat_name} → {link}')
-                bot_msg_id = 0
-                if tg_token and moderator:
-                    bot_msg_id = await loop.run_in_executor(
-                        _executor, _send_moderation_card, post, tg_token, moderator,
-                    )
-                post['bot_message_id'] = bot_msg_id
-                post['grouped_refs']   = [(msg.chat_id, msg.id)]
-                pend_key = f'{raw_id}:{msg.id}'
-                pending_moderation[pend_key] = post
-                metrics['moderated'] += 1
-                await _safe_sheets_retry(_write_rejected, ss, post, bot_msg_id)
+                await _process_and_publish(post, _client, [msg], ss, _acc)
 
             except Exception as e:
                 metrics['errors'] += 1
@@ -1716,7 +1767,9 @@ async def main():
         f'каналов: {len(state["username_to_meta"])} | '
         f'правил: {len(state["scoring_rules"])} | '
         f'порог: {state["score_threshold"]} | '
-        f'минус-слов: {len(state["minus_words"])}'
+        f'минус-слов: {len(state["minus_words"])} | '
+        f'канал частных: {state["dest_chat_id"]} | '
+        f'канал агентов: {state["dest_chat_id_agent"] or "не задан"}'
     )
 
     # ── Фоновые задачи ─────────────────────────────────────────────────────
