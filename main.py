@@ -429,6 +429,18 @@ def _get_author_info(msg):
     except Exception:
         return '', ''
 
+async def _get_sender_bio(client: TelegramClient, msg) -> str:
+    """Возвращает описание (bio) отправителя или пустую строку."""
+    try:
+        sender = await msg.get_sender()
+        if sender is None:
+            return ''
+        # UserFull содержит about, надо запросить полный профиль
+        from telethon.tl.functions.users import GetFullUserRequest
+        full = await client(GetFullUserRequest(sender))
+        return (full.full_user.about or '').strip()
+    except Exception:
+        return ''
 
 def _utf16_to_unicode_idx(text: str, utf16_offset: int) -> int:
     idx = 0
@@ -555,7 +567,7 @@ def _calc_score(text: str, rules: list) -> int:
 # AI-модерация через Gemini
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _ai_moderate(text: str, score: int) -> str:
+async def _ai_moderate(text: str, score: int, sender_bio: str = '') -> str:
     """
     Отправляет текст поста в Gemini для классификации.
 
@@ -570,7 +582,7 @@ async def _ai_moderate(text: str, score: int) -> str:
     if not GEMINI_API_KEY:
         log.warning('[gemini] GEMINI_API_KEY не задан — решение: manual')
         return 'manual'
-
+    bio_section = f'\n\nОписание аккаунта автора:\n{sender_bio[:500]}' if sender_bio else ''
     prompt = f"""Ты модератор доски объявлений по аренде и продаже недвижимости в Батуми (Грузия).
 
 Твоя задача: определить, является ли сообщение реальным запросом на поиск жилья, и если да — определить тип: от частного лица или от агента/риелтора.
@@ -666,6 +678,10 @@ async def _ai_moderate(text: str, score: int) -> str:
 8. Человек ищет сразу несколько объектов с разными бюджетами в одном посте → скорее всего approve_agent.
 9. Если пост содержит личные детали (семья, дети, питомцы) И одновременно маркер 
    сотрудничества («готов к сотрудничеству» и т.п.) — приоритет у маркера сотрудничества → approve_agent.
+10. Если в описании аккаунта автора упоминается риелторская деятельность
+    («риелтор», «агент», «недвижимость», «broker», «estate», «realty»,
+    «сдам», «продам», «помогу с арендой» и т.п.) — склоняться к approve_agent,
+    даже если текст поста выглядит как частное объявление.
 
 Скоринг системы для этого поста: {score} (выше = больше ключевых слов поиска жилья)
 
@@ -673,7 +689,7 @@ async def _ai_moderate(text: str, score: int) -> str:
 approve_private, approve_agent, skip или manual.
 
 Текст сообщения:
-{text[:2000]}"""
+{text[:2000]}{bio_section}"""
 
     loop = asyncio.get_event_loop()
 
@@ -1170,8 +1186,20 @@ async def _process_and_publish(
         log.info(f'[{acc}][дубль ⛔] {chat_name}')
         return
 
+    # Описание аккаунта
+    sender_bio = ''
+    try:
+        # берём первое сообщение из переданных
+        source_msg = msgs_for_photos[0] if msgs_for_photos else None
+        if source_msg:
+            sender_bio = await _get_sender_bio(client, source_msg)
+            if sender_bio:
+                log.info(f'[{acc}][bio] {sender_bio[:80]}')
+    except Exception as e:
+        log.warning(f'[{acc}] Не удалось получить bio: {e}')
+    
     # AI-модерация
-    ai_decision = await _ai_moderate(text, score)
+    ai_decision = await _ai_moderate(text, score, sender_bio)
     log.info(f'[{acc}][AI:{ai_decision} скор:{score}] {chat_name} → {link}')
 
     post['ai_decision'] = ai_decision
