@@ -81,6 +81,7 @@ state = {
     'id_to_meta':           {},
     'username_to_meta':     {},
     'excluded_accounts':    set(),
+    'realtors':             set(),
 }
 
 TZ_OFFSET_HOURS = 3
@@ -230,6 +231,136 @@ def _read_minus_words(ss):
         log.error('Ошибка чтения минус-слов: ' + str(e), exc_info=True)
         return []
 
+# ── Стало ─────────────────────────────────────────────────────────────────────
+
+def _read_realtors_raw(ss) -> tuple[set, list]:
+    """
+    Читает лист «Риэлторы».
+    Возвращает:
+      resolved   — set[int]  уже известные числовые user_id
+      to_resolve — list[str] username-ы/ссылки, требующие резолва через Telethon
+    """
+    try:
+        try:
+            ws = ss.worksheet('Риэлторы')
+        except Exception:
+            ws = ss.add_worksheet('Риэлторы', 1000, 3)
+            ws.append_row(['user_id', 'имя', 'комментарий'])
+            return set(), []
+
+        resolved   = set()
+        to_resolve = []
+
+        for row in ws.get_all_values()[1:]:
+            if not row or not row[0].strip():
+                continue
+            raw = row[0].strip()
+
+            # Числовой ID (включая отрицательные) — сразу в set
+            if raw.lstrip('-').isdigit():
+                resolved.add(int(raw))
+                continue
+
+            # Ссылка вида https://t.me/username или @username или просто username
+            username = _extract_username(raw)
+            if username:
+                to_resolve.append(username)
+            else:
+                log.warning(f'[риэлторы] Не удалось распознать запись: {repr(raw)}')
+
+        log.info(
+            f'Риэлторы: {len(resolved)} числовых ID, '
+            f'{len(to_resolve)} username для резолва'
+        )
+        return resolved, to_resolve
+
+    except Exception as e:
+        log.error(f'Ошибка чтения риэлторов: {e}', exc_info=True)
+        return set(), []
+
+
+async def _resolve_realtors(
+    ss,
+    clients: dict,
+    resolved: set,
+    to_resolve: list,
+) -> set:
+    """
+    Резолвит список username-ов через Telethon → user_id (int).
+    Найденные ID записывает обратно в лист (колонка A), чтобы при
+    следующей загрузке они уже читались как числа без повторного резолва.
+    Возвращает итоговый set[int].
+    """
+    if not to_resolve:
+        return resolved
+
+    client = next(iter(clients.values()), None)
+    if not client:
+        log.warning('[риэлторы] Нет Telethon-клиента для резолва username-ов')
+        return resolved
+
+    try:
+        ws   = ss.worksheet('Риэлторы')
+        rows = ws.get_all_values()           # включая заголовок
+    except Exception as e:
+        log.error(f'[риэлторы] Не удалось открыть лист для обновления: {e}')
+        return resolved
+
+    # Индекс строк по username (lowercase) → номер строки в Sheets (1-based)
+    row_index: dict[str, int] = {}
+    for i, row in enumerate(rows[1:], start=2):
+        if not row or not row[0].strip():
+            continue
+        raw = row[0].strip()
+        if not raw.lstrip('-').isdigit():
+            uname = _extract_username(raw)
+            if uname:
+                row_index[uname.lower()] = i
+
+    newly_resolved = set()
+
+    for username in to_resolve:
+        try:
+            entity  = await client.get_entity(username)
+            user_id = entity.id          # для юзеров всегда положительный int
+            resolved.add(user_id)
+            newly_resolved.add(user_id)
+            log.info(f'[риэлторы] @{username} → user_id={user_id}')
+
+            # Перезаписываем ячейку числовым ID, чтобы больше не резолвить
+            sheet_row = row_index.get(username.lower())
+            if sheet_row:
+                try:
+                    ws.update(
+                        values=[[str(user_id)]],
+                        range_name=f'A{sheet_row}',
+                    )
+                except Exception as e:
+                    log.warning(f'[риэлторы] Не удалось обновить A{sheet_row}: {e}')
+
+        except FloodWaitError as e:
+            log.warning(f'[риэлторы] FloodWait {e.seconds}s при резолве @{username}')
+            await asyncio.sleep(e.seconds + 2)
+            try:
+                entity  = await client.get_entity(username)
+                user_id = entity.id
+                resolved.add(user_id)
+                newly_resolved.add(user_id)
+            except Exception as e2:
+                log.warning(f'[риэлторы] Повторная ошибка @{username}: {e2}')
+
+        except (UsernameNotOccupiedError, UsernameInvalidError) as e:
+            log.warning(f'[риэлторы] Username не найден @{username}: {e}')
+
+        except Exception as e:
+            log.warning(f'[риэлторы] Ошибка резолва @{username}: {e}')
+
+        await asyncio.sleep(0.5)   # пауза между запросами к TG
+
+    if newly_resolved:
+        log.info(f'[риэлторы] Резолвлено username → ID: {newly_resolved}')
+
+    return resolved
 
 def _read_channels(ss):
     try:
@@ -264,6 +395,9 @@ def _local_dt(dt: datetime) -> datetime:
     tz_local = timezone(timedelta(hours=TZ_OFFSET_HOURS))
     return dt.replace(tzinfo=timezone.utc).astimezone(tz_local).replace(tzinfo=None)
 
+def _flatten_text(text: str) -> str:
+    """Убирает переносы строк и лишние пробелы — одна строка для хранения в Sheets."""
+    return re.sub(r'\s+', ' ', text or '').strip()
 
 def _write_post(ss, post):
     try:
@@ -273,7 +407,7 @@ def _write_post(ss, post):
             post['author_name'],
             post['author_link'],
             post['link'],
-            post['text'],
+            _flatten_text(post['text']),   # ← было post['text']
             post['score'],
             post['account'],
             post.get('ai_decision', ''),
@@ -289,7 +423,7 @@ def _write_rejected(ss, post, bot_message_id):
             _local_dt(post['date']).strftime('%Y-%m-%d %H:%M:%S'),
             post['chat_name'],
             post['link'],
-            post['text'],
+            _flatten_text(post['text']),   # ← было post['text']
             post['score'],
             'ожидает',
             str(bot_message_id),
@@ -306,7 +440,7 @@ def _write_ai_rejected(ss, post: dict, ai_decision: str):
             _local_dt(post['date']).strftime('%Y-%m-%d %H:%M:%S'),
             post['chat_name'],
             post['link'],
-            post['text'],
+            _flatten_text(post['text']),   # ← было post['text']
             post['score'],
             ai_decision,
             post['account'],
@@ -316,7 +450,6 @@ def _write_ai_rejected(ss, post: dict, ai_decision: str):
 
 
 def _write_ask_author(ss, post: dict, user_id: int):
-    """Запись в лист «Ожидание» — пост ожидает ответа от автора."""
     try:
         try:
             ws = ss.worksheet('Ожидание')
@@ -333,7 +466,7 @@ def _write_ask_author(ss, post: dict, user_id: int):
             post['author_link'],
             post['chat_name'],
             post['link'],
-            post['text'][:500],
+            _flatten_text(post['text']),   # ← уже было [:500], теперь ещё и flatten
             'ожидает',
             '',
         ], value_input_option='USER_ENTERED')
@@ -884,6 +1017,14 @@ def _pick_dest_chat(ai_decision: str) -> str:
 
 async def _do_publish(post: dict, client: TelegramClient, ss, acc: str, ai_decision: str):
     """Финальная публикация поста в нужный канал."""
+    # ── Проверка списка риэлторов (переопределяет решение AI, кроме skip) ─
+    user_id = post.get('user_id', 0)
+    async with _state_lock:
+        realtors = set(state.get('realtors', set()))
+    if user_id and user_id in realtors and ai_decision not in ('approve_agent', 'skip'):
+        log.info(f'[{acc}][риэлтор из списка →_do_publish] user_id={user_id} → approve_agent')
+        ai_decision = 'approve_agent'
+
     post['ai_decision'] = ai_decision
     target = _pick_dest_chat(ai_decision)
     fp     = _post_fingerprint(post['text'], post['author_name'])
@@ -1393,6 +1534,16 @@ async def _process_and_publish(
 
     # ── 4. AI-модерация ────────────────────────────────────────────────────
     ai_decision = await _ai_moderate(text, score, sender_bio)
+
+    # ── Проверка списка риэлторов (skip не переопределяем) ─────────────────
+    async with _state_lock:
+        realtors = set(state.get('realtors', set()))
+    if user_id and user_id in realtors and ai_decision != 'skip':
+        if ai_decision != 'approve_agent':
+            log.info(f'[{acc}][риэлтор из списка] user_id={user_id} '
+                     f'{ai_decision} → approve_agent')
+        ai_decision = 'approve_agent'
+      
     log.info(f'[{acc}][AI:{ai_decision} скор:{score}] {chat_name} → {link}')
 
     post['ai_decision'] = ai_decision
@@ -1449,7 +1600,7 @@ async def _process_and_publish(
             f'[{acc}][ask_author ✉️] user_id={user_id} | '
             f'ожидаем {ASK_AUTHOR_TIMEOUT_SEC}s | {link}'
         )
-        await _safe_sheets(_write_ask_author, ss, post, user_id)
+        await _safe_sheets_retry(_write_ask_author, ss, post, user_id)
         return
 
     # Неизвестный ответ AI — approve_private
@@ -1469,6 +1620,8 @@ async def _settings_reload_loop(clients: dict, ss):
             new_settings = await _safe_sheets_result(_read_settings,      ss)
             new_rules    = await _safe_sheets_result(_read_scoring_rules, ss)
             new_minus    = await _safe_sheets_result(_read_minus_words,   ss)
+            resolved_r, to_resolve_r = await _safe_sheets_result(_read_realtors_raw, ss)
+            new_realtors = await _resolve_realtors(ss, clients, resolved_r, to_resolve_r)
             new_channels = await _safe_sheets_result(_read_channels,      ss)
 
             if new_settings:
@@ -1487,6 +1640,8 @@ async def _settings_reload_loop(clients: dict, ss):
                 async with _state_lock: state['scoring_rules'] = new_rules
             if new_minus  is not None:
                 async with _state_lock: state['minus_words']   = new_minus
+            if new_realtors  is not None:
+                async with _state_lock: state['realtors']      = new_realtors
             if new_channels is not None:
                 await _update_watched_chats(clients, new_channels, ss)
 
@@ -1732,6 +1887,7 @@ async def main():
     settings = await _safe_sheets_result(_read_settings,      ss)
     rules    = await _safe_sheets_result(_read_scoring_rules, ss)
     minus    = await _safe_sheets_result(_read_minus_words,   ss)
+    resolved_r, to_resolve_r = await _safe_sheets_result(_read_realtors_raw, ss)
     channels = await _safe_sheets_result(_read_channels,      ss)
 
     # ── Загрузка fingerprints из обоих листов ──────────────────────────────
@@ -1771,6 +1927,7 @@ async def main():
         f'канал частных: {state["dest_chat_id"]} | '
         f'канал агентов: {state["dest_chat_id_agent"] or "не задан"} | '
         f'таймаут ask_author: {ASK_AUTHOR_TIMEOUT_SEC}s'
+        f'риэлторов: {len(state["realtors"])} | '
     )
 
     if GEMINI_API_KEY:
@@ -1807,6 +1964,9 @@ async def main():
     if not clients:
         log.error('Ни один аккаунт не подключён — выход')
         return
+    # ── Резолв риэлторов (требует готовых clients) ─────────────────────────
+    realtors = await _resolve_realtors(ss, clients, resolved_r, to_resolve_r)
+    state['realtors'] = realtors
 
     # ── Резолв каналов ─────────────────────────────────────────────────────
     cached_meta = await _safe_sheets_result(_read_entity_cache, ss)
