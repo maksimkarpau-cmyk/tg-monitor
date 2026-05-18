@@ -1,6 +1,12 @@
 """
-TG Parser v3 — один аккаунт (или два), скоринг + AI-модерация через Gemini.
+TG Parser v4 — один аккаунт (или два), скоринг + AI-модерация через Gemini.
 Маршрутизация: approve_private → dest_chat_id, approve_agent → dest_chat_id_agent.
+Новое в v4:
+  - 4 класса AI: approve_private, approve_agent, ask_author, skip
+  - ask_author: Telethon пишет автору в личку, ждёт ответ 15 минут,
+    повторно прогоняет через AI → публикует в нужный канал
+  - Дедупликация по листам «Посты» И «Отклонено ИИ» (не делаем повторных запросов к AI)
+  - Запись ожидающих ответа в лист «Ожидание»
 """
 import asyncio
 import base64
@@ -24,6 +30,9 @@ from telethon.errors import (
     FloodWaitError,
     UsernameInvalidError,
     UsernameNotOccupiedError,
+    UserIsBlockedError,
+    ChatWriteForbiddenError,
+    InputUserDeactivatedError,
 )
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageService, MessageEmpty
@@ -43,6 +52,9 @@ GOOGLE_CREDENTIALS_B64 = os.environ.get('GOOGLE_CREDENTIALS_BASE64', '')
 SETTINGS_RELOAD_SEC    = int(os.environ.get('SETTINGS_RELOAD_INTERVAL', '300'))
 EXECUTOR_WORKERS       = int(os.environ.get('EXECUTOR_WORKERS', '8'))
 GEMINI_API_KEY         = os.environ.get('GEMINI_API_KEY', '')
+
+# Таймаут ожидания ответа от автора (секунды)
+ASK_AUTHOR_TIMEOUT_SEC = int(os.environ.get('ASK_AUTHOR_TIMEOUT_SEC', '900'))  # 15 минут
 
 # ── Логирование ────────────────────────────────────────────────────────────────
 
@@ -74,13 +86,36 @@ TZ_OFFSET_HOURS = 3
 
 seen_ids: deque = deque(maxlen=2000)
 published_fingerprints: deque = deque(maxlen=10000)
+
+# Fingerprints постов уже отклонённых AI — не делаем повторный запрос к Gemini
+ai_rejected_fingerprints: deque = deque(maxlen=10000)
+
 pending_moderation: dict = {}
+
+# Словарь ожидания ответа от автора поста
+# Ключ: user_id (int)
+# Значение: {
+#   'post': dict,
+#   'client': TelegramClient,
+#   'ss': spreadsheet,
+#   'acc': str,
+#   'sender_bio': str,
+#   'added_at': float,
+#   'timeout_handle': asyncio.TimerHandle,
+# }
+pending_ask_author: dict = {}
 
 _executor = ThreadPoolExecutor(max_workers=EXECUTOR_WORKERS)
 _sheets_lock: asyncio.Lock | None = None
 _state_lock:  asyncio.Lock | None = None
 
-metrics = {'processed': 0, 'published': 0, 'moderated': 0, 'errors': 0}
+metrics = {
+    'processed': 0,
+    'published': 0,
+    'moderated': 0,
+    'asked':     0,
+    'errors':    0,
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -271,6 +306,45 @@ def _write_ai_rejected(ss, post: dict, ai_decision: str):
         log.error(f'Ошибка записи в Отклонено ИИ: {e}', exc_info=True)
 
 
+def _write_ask_author(ss, post: dict, user_id: int):
+    """Запись в лист «Ожидание» — пост ожидает ответа от автора."""
+    try:
+        try:
+            ws = ss.worksheet('Ожидание')
+        except Exception:
+            ws = ss.add_worksheet('Ожидание', 1000, 9)
+            ws.append_row([
+                'timestamp', 'user_id', 'author_name', 'author_link',
+                'chat_name', 'post_link', 'post_text', 'статус', 'ai_decision_final',
+            ])
+        ws.append_row([
+            _local_now().strftime('%Y-%m-%d %H:%M:%S'),
+            str(user_id),
+            post['author_name'],
+            post['author_link'],
+            post['chat_name'],
+            post['link'],
+            post['text'][:500],
+            'ожидает',
+            '',
+        ], value_input_option='USER_ENTERED')
+    except Exception as e:
+        log.error(f'Ошибка записи в Ожидание: {e}', exc_info=True)
+
+
+def _update_ask_author_status(ss, user_id: int, status: str, ai_decision: str = ''):
+    """Обновляет статус строки в листе «Ожидание» по user_id (первая строка со статусом 'ожидает')."""
+    try:
+        ws   = ss.worksheet('Ожидание')
+        data = ws.get_all_values()
+        for i, row in enumerate(data[1:], start=2):
+            if len(row) > 1 and row[1] == str(user_id) and (len(row) < 8 or row[7] == 'ожидает'):
+                ws.update(values=[[status, ai_decision]], range_name=f'H{i}:I{i}')
+                return
+    except Exception as e:
+        log.error(f'Ошибка обновления статуса Ожидание: {e}', exc_info=True)
+
+
 def _write_log(ss, level, message, account=''):
     try:
         safe = str(message)
@@ -353,6 +427,52 @@ def _update_rejected_status(ss, bot_message_id: int, new_status: str):
         log.error(f'Ошибка обновления статуса отклонённого поста: {e}', exc_info=True)
 
 
+# ── Fingerprints ───────────────────────────────────────────────────────────────
+
+def _post_fingerprint(text: str, author_name: str) -> str:
+    norm = unicodedata.normalize('NFKC', text.lower())
+    norm = re.sub(r'[\s\W]+', '', norm)[:120]
+    author_key = re.sub(r'\s+', '', author_name.lower())
+    return f'{author_key}|{norm}'
+
+
+def _load_published_fingerprints(ss) -> set:
+    try:
+        data = ss.worksheet('Посты').get_all_values()
+        result = set()
+        for row in data[1:]:
+            text        = row[5].strip() if len(row) > 5 else ''
+            author_name = row[2].strip() if len(row) > 2 else ''
+            if text:
+                result.add(_post_fingerprint(text, author_name))
+        log.info(f'Загружено {len(result)} fingerprint-ов из листа «Посты»')
+        return result
+    except Exception as e:
+        log.error(f'Ошибка загрузки fingerprints (Посты): {e}', exc_info=True)
+        return set()
+
+
+def _load_ai_rejected_fingerprints(ss) -> set:
+    """
+    Загружает fingerprints из листа «Отклонено ИИ».
+    Используем пустой author_name — в этом листе автор не хранится.
+    Это позволяет отсекать дубли одного поста из разных групп,
+    не делая повторных запросов к Gemini.
+    """
+    try:
+        data = ss.worksheet('Отклонено ИИ').get_all_values()
+        result = set()
+        for row in data[1:]:
+            text = row[3].strip() if len(row) > 3 else ''  # колонка D — текст поста
+            if text:
+                result.add(_post_fingerprint(text, ''))
+        log.info(f'Загружено {len(result)} fingerprint-ов из листа «Отклонено ИИ»')
+        return result
+    except Exception as e:
+        log.error(f'Ошибка загрузки fingerprints (Отклонено ИИ): {e}', exc_info=True)
+        return set()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Утилиты
 # ══════════════════════════════════════════════════════════════════════════════
@@ -416,31 +536,34 @@ def _build_link(chat, msg_id: int) -> str:
 
 
 def _get_author_info(msg):
+    """Возвращает (name, link, user_id)."""
     try:
         sender = msg.sender
         if not sender:
-            return '', ''
+            return '', '', 0
         first    = getattr(sender, 'first_name', '') or ''
         last     = getattr(sender, 'last_name',  '') or ''
         username = getattr(sender, 'username',   '') or ''
-        name = (first + ' ' + last).strip()
-        link = f'https://t.me/{username}' if username else ''
-        return name, link
+        name     = (first + ' ' + last).strip()
+        link     = f'https://t.me/{username}' if username else ''
+        user_id  = getattr(sender, 'id', 0) or 0
+        return name, link, user_id
     except Exception:
-        return '', ''
+        return '', '', 0
+
 
 async def _get_sender_bio(client: TelegramClient, msg) -> str:
-    """Возвращает описание (bio) отправителя или пустую строку."""
+    """Возвращает bio отправителя или пустую строку."""
     try:
         sender = await msg.get_sender()
         if sender is None:
             return ''
-        # UserFull содержит about, надо запросить полный профиль
         from telethon.tl.functions.users import GetFullUserRequest
         full = await client(GetFullUserRequest(sender))
         return (full.full_user.about or '').strip()
     except Exception:
         return ''
+
 
 def _utf16_to_unicode_idx(text: str, utf16_offset: int) -> int:
     idx = 0
@@ -519,20 +642,6 @@ def _text_to_html(text: str, entities) -> str:
 # Фильтрация и скоринг
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _has_minus_word(text: str, minus_words: list) -> bool:
-    lower = text.lower()
-    for w in minus_words:
-        if not w:
-            continue
-        if len(w) <= 4:
-            if re.search(r'(?<![а-яёa-z])' + re.escape(w) + r'(?![а-яёa-z])', lower):
-                return True
-        else:
-            if w in lower:
-                return True
-    return False
-
-
 def _find_minus_word(text: str, minus_words: list) -> str | None:
     lower = text.lower()
     for w in minus_words:
@@ -567,131 +676,117 @@ def _calc_score(text: str, rules: list) -> int:
 # AI-модерация через Gemini
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def _ai_moderate(text: str, score: int, sender_bio: str = '') -> str:
-    """
-    Отправляет текст поста в Gemini для классификации.
+def _build_prompt(text: str, score: int, sender_bio: str, is_reply: bool = False) -> str:
+    bio_block = (
+        f'Описание аккаунта автора (bio):\n{sender_bio[:500]}'
+        if sender_bio else
+        'Описание аккаунта автора (bio): не указано'
+    )
 
-    Возвращает одно из четырёх значений:
-      'approve_private' — частный человек ищет жильё → публикуем в основной канал
-      'approve_agent'   — агент/риелтор ищет для клиента → публикуем в агентский канал
-      'skip'            — отклонить (предложение о сдаче/продаже, спам, не по теме)
-      'manual'          — отправить на ручную модерацию в бот
+    if is_reply:
+        return f"""Ты модератор доски объявлений по аренде недвижимости в Батуми.
+Ты уже написал автору поста с вопросом "Вы риелтор или ищете для себя?" и получил ответ.
+Определи по ответу: это частный человек или риелтор/агент.
 
-    Если GEMINI_API_KEY не задан или ошибка сети — возвращает 'manual'.
-    """
-    if not GEMINI_API_KEY:
-        log.warning('[gemini] GEMINI_API_KEY не задан — решение: manual')
-        return 'manual'
-    bio_section = f'\n\nОписание аккаунта автора:\n{sender_bio[:500]}' if sender_bio else ''
-    prompt = f"""Ты модератор доски объявлений по аренде и продаже недвижимости в Батуми (Грузия).
+{bio_block}
 
-Твоя задача: определить, является ли сообщение реальным запросом на поиск жилья, и если да — определить тип: от частного лица или от агента/риелтора.
+Ответ автора на вопрос:
+{text[:1000]}
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ЧАСТНЫЙ ЗАПРОС → approve_private
+Отвечай СТРОГО одним словом: approve_private или approve_agent."""
 
-Обычный человек ищет жильё для себя, семьи или друга (не профессиональный агент):
+    return f"""Ты модератор доски объявлений по аренде и продаже недвижимости в Батуми (Грузия).
 
-• Прямой запрос — «ищу», «сниму», «куплю», «арендую» + хоть один параметр (тип жилья, район, срок, бюджет, количество комнат). Даже очень короткий:
-  «Сниму орби до конца мая», «Ищу студию в аренду на год», «Куплю 1+1 до 80 000$»
-
-• Описывает себя лично: «мы с женой», «без вредных привычек», «работаем удалённо», «пара без животных»
-
-• Ищет нестандартное жильё для себя — вилла, дом, таунхаус, этаж в доме, комната, дача, коттедж
-
-• Ищет коммерческую недвижимость для себя — помещение, офис, кабинет, бьюти-кабинет, коворкинг:
-  «Ищу помещение 50–100 м² под аренду», «Ищу квартиру под офис»
-
-• Срочный выкуп квартиры «для себя» по фиксированной цене
-
-• Ищет риелтора/агента, чтобы найти жильё для себя:
-  «Ищу надёжного агента по недвижимости», «Ищу риелтора — есть предложение»
-
-• Ответ или комментарий в ветке без чётко выраженного запроса — просто реплика:
-  «Я живу сейчас в орби и ищу квартиру в другом месте»
-  «А вообще реально снять квартиру в нормальном районе за 400–500$?» (риторический вопрос)
+Твоя задача: определить тип поста и маршрут публикации.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-АГЕНТСКИЙ ЗАПРОС → approve_agent
+ТОЧНО ЧАСТНЫЙ → approve_private
 
-Риелтор, агент или управляющая компания ищет жильё профессионально:
+Человек явно ищет жильё для себя — есть хотя бы один личный маркер:
 
-• Явные маркеры поиска для клиента: «для клиента», «клиенту», «под клиента», «сниму клиенту»:
-  «Ищу для клиента 1+1», «Сниму клиенту студию», «Куплю для клиента 2+1 в каркасе»
+• Описывает себя или свою ситуацию: «мы с женой», «я с семьёй», «с детьми», «с мужем»,
+  «пара», «без вредных привычек», «не курю», «работаем удалённо», «с собакой», «с кошкой»,
+  «без животных», «для себя», «для нас», «переезжаю», «приезжаю»
 
-• Профессиональная самоидентификация в тексте: «риелтор», «агент», «недвижимость», «broker», «estate», «realty», «управляющая компания»
+• Описывает бытовые детали под себя: «нужна парковка», «тихий район», «рядом со школой»,
+  «близко к морю для прогулок», «нужна стиральная машина»
 
-• Профессиональные формулировки: «сотрудничаю», «гарантирую быструю сдачу», «работаю по договору с описью», «договор + опись»
+• Пишет от первого лица про личные обстоятельства: «работаю в батуми», «учусь здесь»,
+  «нас двое», «я один», «живу один»
 
-• Ищет сразу несколько объектов в одном посте с разными параметрами:
-  «1+1 за 600$, 2+1 за 900$» — скорее всего агент с несколькими клиентами
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ТОЧНО АГЕНТ → approve_agent
 
-• Срочный выкуп «для клиента» по фиксированной цене
+Риелтор или агент — есть хотя бы один профессиональный маркер:
 
-• Предлагает сотрудничество собственникам прямо в посте о поиске
+• Явный поиск для клиента: «для клиента», «клиенту», «под клиента», «сниму клиенту»
 
-• Предлагает сотрудничество собственникам прямо в тексте поста:
-  «Готов к сотрудничеству», «открыт к сотрудничеству», «рассмотрю сотрудничество»,
-  «готов работать с агентами», «сотрудничаю с собственниками»
+• Профессиональная идентификация: «риелтор», «агент», «broker», «estate», «realty»,
+  «управляющая компания», «агентство»
+
+• Профессиональные формулировки: «готов к сотрудничеству», «открыт к сотрудничеству»,
+  «сотрудничаю с собственниками», «гарантирую быструю сдачу»,
+  «работаю по договору с описью», «договор + опись»
+
+• Ищет несколько объектов с разными бюджетами: «1+1 за 600$, 2+1 за 900$»
+
+• В bio упоминается риелторская деятельность: «риелтор», «агент по недвижимости»,
+  «помогу с арендой», «подбор недвижимости», «broker», «estate», «realty»
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+НУЖНО УТОЧНИТЬ → ask_author
+
+Пост выглядит как запрос жилья, но нет ни личных, ни агентских маркеров.
+Нейтральный пост — невозможно определить кто автор:
+
+  «Ищу 1+1 в аренду, бюджет 600$» → ask_author
+  «Сниму студию в центре на год» → ask_author
+  «#сниму Ищу дом в Гонио с 14 по 26 июня» → ask_author
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ОТКЛОНИТЬ → skip
 
-• Объявление от собственника или агента о СДАЧЕ или ПРОДАЖЕ жилья:
-  «Сдаю квартиру», «Продаю студию», «Есть варианты», «Предлагаем апартаменты»
-  ИСКЛЮЧЕНИЕ: «Сдача в аренду ... я ищу клиента» — это агент ищет арендатора → skip
-
-• Реклама агентства или риелторских услуг без конкретного запроса на поиск жилья:
-  «Наша риелтор Вероника, узнайте у неё», «Мы занимаемся посуточной арендой»
-
-• Сообщение не связано с недвижимостью вообще:
-  «Ищу официанта», «Хочу купить пишущую машинку», «Ищу друзей из других стран»
-
-• Туристические советы, вопросы об отдыхе без конкретного запроса жилья:
-  «Хочется на магнитные пески и в домик в горах, есть информация о коттеджах?»
-
-• Человек ищет соседа, подселение или совместную аренду:
-  «Ищу девушку на подселение», «Ищу соседа для совместного съёма»
-
-• Вопрос об оформлении документов при переезде без конкретного запроса жилья:
-  «Нужно ли по приезду в Батуми где-то оформлять документы?»
-
-• Флуд, жалобы на засорение чата, поздравления, посторонние обсуждения
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-РУЧНАЯ МОДЕРАЦИЯ → manual
-
-• Текст неоднозначный — невозможно уверенно определить, ищет человек жильё или что-то другое
-• Запрос есть, но не хватает информации для уверенного решения
-• Невозможно определить: частное лицо или агент
+• Объявление о СДАЧЕ или ПРОДАЖЕ: «сдаю», «продаю», «сдаётся», «есть варианты»
+• Реклама агентства без конкретного запроса на поиск жилья
+• Не связано с недвижимостью: вакансии, услуги, личные вопросы
+• Ищет соседа или подселение
+• Туристические вопросы без запроса жилья
+• Флуд, жалобы, поздравления
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ВАЖНЫЕ ПРАВИЛА:
 
-1. Короткий текст — НЕ причина для отклонения или manual. «Сниму орби до конца мая» → approve_private.
-2. Агент пишет «для клиента» или «клиенту» → approve_agent, даже если пост короткий.
-3. Если человек называет бюджет, район, тип жилья или срок — это реальный запрос → approve_*.
-4. Слово «сдача» или «сдаю» от лица собственника/агента → skip.
-5. Коммерческая недвижимость (помещение, офис, кабинет) — всё равно approve, это тоже спрос.
-6. Ищут жильё только в Батуми и окрестностях (Кабулети, Гонио, Квариати, Сарпи, Махинджаури, Букнари, Чакви, Цихисдзири) — одобряй.
-7. Запросы на нескольких языках (русский + грузинский + английский) — одобряй.
-8. Человек ищет сразу несколько объектов с разными бюджетами в одном посте → скорее всего approve_agent.
-9. Если пост содержит личные детали (семья, дети, питомцы) И одновременно маркер 
-   сотрудничества («готов к сотрудничеству» и т.п.) — приоритет у маркера сотрудничества → approve_agent.
-10. Если в описании аккаунта автора упоминается риелторская деятельность
-    («риелтор», «агент», «недвижимость», «broker», «estate», «realty»,
-    «сдам», «продам», «помогу с арендой» и т.п.) — склоняться к approve_agent,
-    даже если текст поста выглядит как частное объявление.
+1. Есть личный маркер → approve_private, даже если пост короткий.
+2. Есть агентский маркер → approve_agent (приоритет над личными деталями).
+3. Нет ни тех ни других маркеров, но явный запрос жилья → ask_author.
+4. «Сдаю», «сдаётся», «продаю» от владельца → skip.
+5. Ищут в Батуми и окрестностях (Кабулети, Гонио, Квариати, Сарпи, Махинджаури,
+   Букнари, Чакви, Цихисдзири) — одобряй.
+6. Запросы на нескольких языках (русский + грузинский + английский) — одобряй.
+7. Bio с риелторской деятельностью → approve_agent.
 
-Скоринг системы для этого поста: {score} (выше = больше ключевых слов поиска жилья)
+Скоринг системы: {score} (выше = больше ключевых слов поиска жилья)
 
-Отвечай СТРОГО одним словом без пробелов и знаков препинания:
-approve_private, approve_agent, skip или manual.
+{bio_block}
+
+Отвечай СТРОГО одним словом: approve_private, approve_agent, ask_author или skip.
 
 Текст сообщения:
-{text[:2000]}{bio_section}"""
+{text[:2000]}"""
 
-    loop = asyncio.get_event_loop()
+
+async def _ai_moderate(text: str, score: int, sender_bio: str = '', is_reply: bool = False) -> str:
+    """
+    Классифицирует текст через Gemini.
+    Возвращает: approve_private | approve_agent | ask_author | skip
+    При ошибке возвращает approve_private (безопасный fallback).
+    """
+    if not GEMINI_API_KEY:
+        log.warning('[gemini] GEMINI_API_KEY не задан — fallback: approve_private')
+        return 'approve_private'
+
+    prompt = _build_prompt(text, score, sender_bio, is_reply=is_reply)
+    loop   = asyncio.get_event_loop()
 
     def _call_gemini() -> str:
         url = (
@@ -712,10 +807,9 @@ approve_private, approve_agent, skip или manual.
         )
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode('utf-8'))
+                data      = json.loads(resp.read().decode('utf-8'))
                 candidate = data.get('candidates', [{}])[0]
-                content   = candidate.get('content', {})
-                parts     = content.get('parts', [])
+                parts     = candidate.get('content', {}).get('parts', [])
                 answer    = ''
                 for part in parts:
                     if part.get('type') == 'thought':
@@ -725,36 +819,139 @@ approve_private, approve_agent, skip или manual.
                         answer = text_val.strip().lower()
                         break
                 log.debug(f'[gemini] raw answer: {repr(answer)}')
-                if 'approve_agent' in answer:
-                    return 'approve_agent'
-                if 'approve_private' in answer:
-                    return 'approve_private'
-                # Проверяем просто 'approve' после того как исключили оба специфичных варианта
-                if answer == 'approve':
-                    return 'approve_private'
-                if 'skip' in answer:
-                    return 'skip'
-                return 'manual'
+                if 'approve_agent'   in answer: return 'approve_agent'
+                if 'approve_private' in answer: return 'approve_private'
+                if answer == 'approve':          return 'approve_private'
+                if 'ask_author'      in answer: return 'ask_author'
+                if 'skip'            in answer: return 'skip'
+                return 'approve_private'
         except urllib.error.HTTPError as e:
             body = ''
             try:
                 body = e.read().decode('utf-8')
             except Exception:
                 pass
-            log.warning(f'[gemini] HTTP {e.code}: {body[:200]} — решение: manual')
-            return 'manual'
+            log.warning(f'[gemini] HTTP {e.code}: {body[:200]} — fallback: approve_private')
+            return 'approve_private'
         except Exception as e:
-            log.warning(f'[gemini] ошибка запроса: {e} — решение: manual')
-            return 'manual'
+            log.warning(f'[gemini] ошибка: {e} — fallback: approve_private')
+            return 'approve_private'
 
     return await loop.run_in_executor(_executor, _call_gemini)
 
 
 def _pick_dest_chat(ai_decision: str) -> str:
-    """Возвращает ID канала для публикации на основе решения AI."""
     if ai_decision == 'approve_agent' and state.get('dest_chat_id_agent'):
         return state['dest_chat_id_agent']
     return state['dest_chat_id']
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ask_author — отправка вопроса автору и обработка ответа
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _do_publish(post: dict, client: TelegramClient, ss, acc: str, ai_decision: str):
+    """Финальная публикация поста в нужный канал."""
+    post['ai_decision'] = ai_decision
+    target = _pick_dest_chat(ai_decision)
+    fp     = _post_fingerprint(post['text'], post['author_name'])
+
+    refs   = post.get('grouped_refs', [])
+    msgs   = await _fetch_messages_by_refs(client, refs) if refs else []
+    photos = await _download_photos(client, msgs) if msgs else []
+
+    published_fingerprints.append(fp)
+    await _safe_sheets_retry(_write_post, ss, post)
+    metrics['published'] += 1
+    log.info(
+        f'[✅ опубликовано AI:{ai_decision} acc:{acc}] '
+        f'{post["chat_name"]} → {post["link"]} (канал: {target or "не задан"})'
+    )
+    if target:
+        ok = await _publish_post(client, post, target, photos or None)
+        if not ok:
+            metrics['errors'] += 1
+
+
+async def _ask_author_timeout(user_id: int):
+    """Вызывается по таймауту — автор не ответил → публикуем как approve_private."""
+    entry = pending_ask_author.pop(user_id, None)
+    if not entry:
+        return
+    post   = entry['post']
+    client = entry['client']
+    ss     = entry['ss']
+    acc    = entry['acc']
+
+    log.info(f'[ask_author ⏱️ таймаут] user_id={user_id} → approve_private | {post["link"]}')
+    await _safe_sheets(_update_ask_author_status, ss, user_id, 'таймаут', 'approve_private')
+    await _do_publish(post, client, ss, acc, 'approve_private')
+
+
+async def _send_ask_author_message(client: TelegramClient, user_id: int, post_link: str) -> bool:
+    """
+    Отправляет вопрос автору в личку через Telethon userbot.
+    Возвращает True если успешно, False если личка закрыта.
+    """
+    text = (
+        f'Добрый день, увидел ваш пост {post_link}. '
+        f'Вы риелтор или ищете для себя?'
+    )
+    try:
+        await client.send_message(user_id, text)
+        return True
+    except (UserIsBlockedError, ChatWriteForbiddenError,
+            InputUserDeactivatedError, ValueError) as e:
+        log.info(f'[ask_author] Личка закрыта user_id={user_id}: {e}')
+        return False
+    except FloodWaitError as e:
+        log.warning(f'[ask_author] FloodWait {e.seconds}s при отправке user_id={user_id}')
+        await asyncio.sleep(e.seconds + 2)
+        try:
+            await client.send_message(user_id, text)
+            return True
+        except Exception as e2:
+            log.warning(f'[ask_author] Повторная ошибка user_id={user_id}: {e2}')
+            return False
+    except Exception as e:
+        log.warning(f'[ask_author] Ошибка отправки user_id={user_id}: {e}')
+        return False
+
+
+async def _handle_author_reply(reply_text: str, user_id: int):
+    """
+    Обрабатывает ответ автора на наш вопрос.
+    Вызывается из хендлера входящих личных сообщений.
+    """
+    entry = pending_ask_author.get(user_id)
+    if not entry:
+        return
+
+    # Отменяем таймаут
+    handle = entry.get('timeout_handle')
+    if handle:
+        handle.cancel()
+
+    pending_ask_author.pop(user_id, None)
+
+    post       = entry['post']
+    client     = entry['client']
+    ss         = entry['ss']
+    acc        = entry['acc']
+    sender_bio = entry.get('sender_bio', '')
+
+    log.info(f'[ask_author 💬 ответ] user_id={user_id}: {repr(reply_text[:100])}')
+
+    # Прогоняем ответ через AI
+    ai_decision = await _ai_moderate(reply_text, 0, sender_bio, is_reply=True)
+
+    # Если AI не определил однозначно — в частные (безопасный fallback)
+    if ai_decision not in ('approve_private', 'approve_agent'):
+        ai_decision = 'approve_private'
+
+    log.info(f'[ask_author AI:{ai_decision}] user_id={user_id} → {post["link"]}')
+    await _safe_sheets(_update_ask_author_status, ss, user_id, 'ответил', ai_decision)
+    await _do_publish(post, client, ss, acc, ai_decision)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -793,7 +990,6 @@ def _get_updates(token: str, offset: int, timeout: int = 30) -> list:
         'timeout': timeout,
         'allowed_updates': ['callback_query'],
     }, timeout=timeout + 10)
-
     if not result.get('ok'):
         error_code  = result.get('error_code', 0)
         description = result.get('description', '')
@@ -802,15 +998,10 @@ def _get_updates(token: str, offset: int, timeout: int = 30) -> list:
         if error_code in (401, 403):
             raise RuntimeError(f'{error_code}:{description}')
         return []
-
     return result.get('result', [])
 
 
 def _send_moderation_card(post: dict, token: str, moderator_chat_id: str) -> int:
-    """
-    Отправляет карточку поста на ручную модерацию.
-    Три кнопки: частный / агент / пропустить.
-    """
     author_str = '—'
     if post['author_name']:
         if post['author_link']:
@@ -819,7 +1010,6 @@ def _send_moderation_card(post: dict, token: str, moderator_chat_id: str) -> int
             author_str = post['author_name']
 
     pend_key = f'{post["src_chat_id"]}:{post["src_msg_id"]}'
-
     lines = [
         f'📢 <b>Источник:</b> {post["chat_name"]}',
         f'👤 <b>Автор:</b> {author_str}',
@@ -829,7 +1019,6 @@ def _send_moderation_card(post: dict, token: str, moderator_chat_id: str) -> int
         '',
         f'🔗 <a href="{post["link"]}">Открыть сообщение</a>',
     ]
-
     result = _tg_request(token, 'sendMessage', {
         'chat_id':    moderator_chat_id,
         'text':       '\n'.join(lines)[:4096],
@@ -837,8 +1026,8 @@ def _send_moderation_card(post: dict, token: str, moderator_chat_id: str) -> int
         'disable_web_page_preview': True,
         'reply_markup': {
             'inline_keyboard': [[
-                {'text': '👤 Частный',  'callback_data': f'approve_private:{pend_key}'},
-                {'text': '🏢 Агент',    'callback_data': f'approve_agent:{pend_key}'},
+                {'text': '👤 Частный',    'callback_data': f'approve_private:{pend_key}'},
+                {'text': '🏢 Агент',      'callback_data': f'approve_agent:{pend_key}'},
                 {'text': '❌ Пропустить', 'callback_data': f'skip:{pend_key}'},
             ]]
         },
@@ -876,54 +1065,26 @@ def _send_alert(token: str, moderator_chat_id: str, message: str):
     })
 
 
-def _post_fingerprint(text: str, author_name: str) -> str:
-    norm = unicodedata.normalize('NFKC', text.lower())
-    norm = re.sub(r'[\s\W]+', '', norm)[:120]
-    author_key = re.sub(r'\s+', '', author_name.lower())
-    return f'{author_key}|{norm}'
-
-
-def _load_published_fingerprints(ss) -> set:
-    try:
-        data = ss.worksheet('Посты').get_all_values()
-        result = set()
-        for row in data[1:]:
-            text        = row[5].strip() if len(row) > 5 else ''
-            author_name = row[2].strip() if len(row) > 2 else ''
-            if text:
-                result.add(_post_fingerprint(text, author_name))
-        log.info(f'Загружено {len(result)} fingerprint-ов из листа Посты')
-        return result
-    except Exception as e:
-        log.error(f'Ошибка загрузки fingerprints: {e}', exc_info=True)
-        return set()
-
-
 def _build_caption(post: dict) -> str:
     chat_name   = post.get('chat_name', '') or 'Источник'
     link        = post['link']
     author_name = post.get('author_name', '').strip()
     author_link = post.get('author_link', '').strip()
-
     source_line = f'Источник: <a href="{link}">{chat_name}</a>'
-
     if author_name and author_link:
         author_line = f'Автор: <a href="{author_link}">{author_name}</a>'
     elif author_name:
         author_line = f'Автор: {author_name}'
     else:
         author_line = ''
-
     text = post['text']
     header = source_line + '\n' + author_line if author_line else source_line
     max_text = 4096 - len(header) - 3
     if len(text) > max_text:
         text = text[:max_text].rstrip() + '…'
-
     if author_line:
         return f'{author_line}\n{source_line}\n\n{text}'
-    else:
-        return f'{source_line}\n\n{text}'
+    return f'{source_line}\n\n{text}'
 
 
 # ── Bot API helpers для отправки медиа ────────────────────────────────────────
@@ -1040,7 +1201,6 @@ async def _publish_post(client: TelegramClient, post: dict,
     caption = _build_caption(post)
     token   = state.get('tg_token', '')
     loop    = asyncio.get_event_loop()
-
     try:
         if photos and token:
             if len(photos) == 1:
@@ -1124,7 +1284,6 @@ async def _update_watched_chats(clients: dict, channels: list, ss):
                 new_ids.add(vid)
                 new_id_meta[vid] = cached
             continue
-
         meta = await _resolve_entity(clients, username, ss)
         if meta:
             eid = meta['entity_id']
@@ -1136,7 +1295,6 @@ async def _update_watched_chats(clients: dict, channels: list, ss):
 
     added   = new_ids - state['watched_ids']
     removed = state['watched_ids'] - new_ids
-
     async with _state_lock:
         state['watched_ids'] = new_ids
         state['id_to_meta']  = new_id_meta
@@ -1144,15 +1302,13 @@ async def _update_watched_chats(clients: dict, channels: list, ss):
     log.info(f'Каналов в watched_ids: {len(new_ids)} (ключей в id_to_meta: {len(new_id_meta)})')
     if added:   log.info(f'Добавлено ID-ключей: {len(added)}')
     if removed: log.info(f'Убрано ID-ключей: {len(removed)}')
-
     sample = sorted(new_id_meta.keys())[:6]
     log.info(f'Пример ключей id_to_meta: {sample}')
-
     await _safe_sheets(_write_entity_cache, ss)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Вспомогательная функция публикации с AI-маршрутизацией
+# Главная функция обработки поста
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _process_and_publish(
@@ -1163,33 +1319,38 @@ async def _process_and_publish(
     acc: str,
 ):
     """
-    Единая точка AI-модерации и публикации для одиночных сообщений и альбомов.
-    Убирает дублирование логики между двумя хендлерами.
+    Единая точка AI-модерации и публикации.
+
+    Порядок:
+      1. Дедупликация по published_fingerprints (лист «Посты»)
+      2. Дедупликация по ai_rejected_fingerprints (лист «Отклонено ИИ»)
+      3. Получение bio автора
+      4. AI-модерация → approve_private / approve_agent / ask_author / skip
+      5. Маршрутизация по решению
     """
-    loop = asyncio.get_event_loop()
-
-    async with _state_lock:
-        threshold     = state['score_threshold']
-        mod_threshold = state['moderation_threshold']
-        tg_token      = state['tg_token']
-        moderator     = state['moderator_chat_id']
-
     text        = post['text']
-    score       = post['score']
     author_name = post['author_name']
     chat_name   = post['chat_name']
+    score       = post['score']
     link        = post['link']
+    user_id     = post.get('user_id', 0)
 
-    # Дедупликация
+    # ── 1. Дедупликация: уже опубликован ──────────────────────────────────
     fp = _post_fingerprint(text, author_name)
     if fp in published_fingerprints:
-        log.info(f'[{acc}][дубль ⛔] {chat_name}')
+        log.info(f'[{acc}][дубль опубликован ⛔] {chat_name}')
         return
 
-    # Описание аккаунта
+    # ── 2. Дедупликация: уже отклонён AI ──────────────────────────────────
+    # Используем fingerprint без автора — тот же текст из другой группы
+    fp_anon = _post_fingerprint(text, '')
+    if fp_anon in ai_rejected_fingerprints:
+        log.info(f'[{acc}][дубль AI-rejected ⛔] {chat_name}')
+        return
+
+    # ── 3. Bio автора ──────────────────────────────────────────────────────
     sender_bio = ''
     try:
-        # берём первое сообщение из переданных
         source_msg = msgs_for_photos[0] if msgs_for_photos else None
         if source_msg:
             sender_bio = await _get_sender_bio(client, source_msg)
@@ -1197,48 +1358,71 @@ async def _process_and_publish(
                 log.info(f'[{acc}][bio] {sender_bio[:80]}')
     except Exception as e:
         log.warning(f'[{acc}] Не удалось получить bio: {e}')
-    
-    # AI-модерация
+
+    # ── 4. AI-модерация ────────────────────────────────────────────────────
     ai_decision = await _ai_moderate(text, score, sender_bio)
     log.info(f'[{acc}][AI:{ai_decision} скор:{score}] {chat_name} → {link}')
 
     post['ai_decision'] = ai_decision
 
-    # Отклонено AI
+    # ── 5. Маршрутизация ───────────────────────────────────────────────────
+
     if ai_decision == 'skip':
+        # Запоминаем fingerprint чтобы не обрабатывать дубли этого поста
+        ai_rejected_fingerprints.append(fp_anon)
         await _safe_sheets_retry(_write_ai_rejected, ss, post, ai_decision)
         return
 
-    # Автопубликация: AI одобрил ИЛИ скор достаточно высокий
-    if ai_decision in ('approve_private', 'approve_agent') or score >= threshold:
-        published_fingerprints.append(fp)
-        photos  = await _download_photos(client, msgs_for_photos)
-        target  = _pick_dest_chat(ai_decision)
-
-        await _safe_sheets_retry(_write_post, ss, post)
-        metrics['published'] += 1
-        log.info(
-            f'[авто ✅ скор:{score} фото:{len(photos)} {acc}] '
-            f'{chat_name} → {link} (канал: {target or "не задан"})'
-        )
-        if target:
-            ok = await _publish_post(client, post, target, photos or None)
-            if not ok:
-                metrics['errors'] += 1
+    if ai_decision in ('approve_private', 'approve_agent'):
+        await _do_publish(post, client, ss, acc, ai_decision)
         return
 
-    # Ручная модерация: AI не уверен И скор ниже порога
-    log.info(f'[модерация ⏳ скор:{score}/{threshold} {acc}] {chat_name} → {link}')
-    bot_msg_id = 0
-    if tg_token and moderator:
-        bot_msg_id = await loop.run_in_executor(
-            _executor, _send_moderation_card, post, tg_token, moderator,
+    if ai_decision == 'ask_author':
+        # Нет user_id — некому писать, публикуем как approve_private
+        if not user_id:
+            log.info(f'[{acc}][ask_author] user_id неизвестен → approve_private')
+            await _do_publish(post, client, ss, acc, 'approve_private')
+            return
+
+        # Уже ожидаем ответа от этого пользователя — не дублируем вопрос
+        if user_id in pending_ask_author:
+            log.info(f'[{acc}][ask_author] user_id={user_id} уже в ожидании → пропуск')
+            return
+
+        # Отправляем вопрос в личку
+        sent = await _send_ask_author_message(client, user_id, link)
+
+        if not sent:
+            # Личка закрыта — публикуем как approve_private
+            log.info(f'[{acc}][ask_author] личка закрыта user_id={user_id} → approve_private')
+            await _do_publish(post, client, ss, acc, 'approve_private')
+            return
+
+        # Регистрируем ожидание с таймером
+        timeout_handle = asyncio.get_event_loop().call_later(
+            ASK_AUTHOR_TIMEOUT_SEC,
+            lambda uid=user_id: asyncio.ensure_future(_ask_author_timeout(uid)),
         )
-    post['bot_message_id'] = bot_msg_id
-    pend_key = f'{post["src_chat_id"]}:{post["src_msg_id"]}'
-    pending_moderation[pend_key] = post
-    metrics['moderated'] += 1
-    await _safe_sheets_retry(_write_rejected, ss, post, bot_msg_id)
+        pending_ask_author[user_id] = {
+            'post':           post,
+            'client':         client,
+            'ss':             ss,
+            'acc':            acc,
+            'sender_bio':     sender_bio,
+            'added_at':       time.time(),
+            'timeout_handle': timeout_handle,
+        }
+        metrics['asked'] += 1
+        log.info(
+            f'[{acc}][ask_author ✉️] user_id={user_id} | '
+            f'ожидаем {ASK_AUTHOR_TIMEOUT_SEC}s | {link}'
+        )
+        await _safe_sheets(_write_ask_author, ss, post, user_id)
+        return
+
+    # Неизвестный ответ AI — approve_private
+    log.warning(f'[{acc}][AI неизвестный ответ: {ai_decision}] → approve_private')
+    await _do_publish(post, client, ss, acc, 'approve_private')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1266,12 +1450,10 @@ async def _settings_reload_loop(clients: dict, ss):
                         'dest_chat_id':         new_settings['dest_chat_id'],
                         'dest_chat_id_agent':   new_settings.get('dest_chat_id_agent', ''),
                     })
-            if new_rules is not None:
-                async with _state_lock:
-                    state['scoring_rules'] = new_rules
-            if new_minus is not None:
-                async with _state_lock:
-                    state['minus_words'] = new_minus
+            if new_rules  is not None:
+                async with _state_lock: state['scoring_rules'] = new_rules
+            if new_minus  is not None:
+                async with _state_lock: state['minus_words']   = new_minus
             if new_channels is not None:
                 await _update_watched_chats(clients, new_channels, ss)
 
@@ -1309,9 +1491,11 @@ async def _heartbeat_loop():
         log.info(
             f'[heartbeat] processed:{metrics["processed"]} '
             f'published:{metrics["published"]} '
+            f'asked:{metrics["asked"]} '
             f'moderated:{metrics["moderated"]} '
             f'errors:{metrics["errors"]} '
-            f'pending:{len(pending_moderation)}'
+            f'pending_mod:{len(pending_moderation)} '
+            f'pending_ask:{len(pending_ask_author)}'
         )
 
 
@@ -1322,7 +1506,6 @@ async def _bot_polling_loop(clients: dict, ss):
     def _first_client() -> TelegramClient | None:
         return next(iter(clients.values()), None)
 
-    # Ждём освобождения слота getUpdates при старте
     token = state['tg_token']
     if token:
         for attempt in range(10):
@@ -1383,8 +1566,6 @@ async def _bot_polling_loop(clients: dict, ss):
             from_id = cq.get('from', {}).get('id', '')
             msg_id  = cq.get('message', {}).get('message_id', 0)
 
-            # Формат callback_data: 'action:src_chat_id:src_msg_id'
-            # action может быть: approve_private, approve_agent, skip
             parts = data.split(':', 2)
             if len(parts) != 3 or parts[0] not in ('approve_private', 'approve_agent', 'skip'):
                 await loop.run_in_executor(
@@ -1409,11 +1590,9 @@ async def _bot_polling_loop(clients: dict, ss):
 
             if action in ('approve_private', 'approve_agent'):
                 client = _first_client()
-
                 async with _state_lock:
                     dest_private = state['dest_chat_id']
                     dest_agent   = state.get('dest_chat_id_agent', '')
-
                 target = dest_agent if (action == 'approve_agent' and dest_agent) else dest_private
 
                 if client and target:
@@ -1501,7 +1680,7 @@ async def _bot_polling_loop(clients: dict, ss):
 
 async def main():
     global _sheets_lock, _state_lock
-    log.info('═══ TG Parser v3 стартует ═══')
+    log.info('═══ TG Parser v4 стартует ═══')
 
     _sheets_lock = asyncio.Lock()
     _state_lock  = asyncio.Lock()
@@ -1521,10 +1700,17 @@ async def main():
     minus    = await _safe_sheets_result(_read_minus_words,   ss)
     channels = await _safe_sheets_result(_read_channels,      ss)
 
-    initial_fps = await _safe_sheets_result(_load_published_fingerprints, ss)
+    # ── Загрузка fingerprints из обоих листов ──────────────────────────────
+    initial_fps  = await _safe_sheets_result(_load_published_fingerprints,    ss)
+    rejected_fps = await _safe_sheets_result(_load_ai_rejected_fingerprints,  ss)
     for fp in initial_fps:
         published_fingerprints.append(fp)
-    log.info(f'Дедупликация: загружено {len(initial_fps)} записей из Посты')
+    for fp in rejected_fps:
+        ai_rejected_fingerprints.append(fp)
+    log.info(
+        f'Дедупликация: {len(initial_fps)} из «Посты», '
+        f'{len(rejected_fps)} из «Отклонено ИИ»'
+    )
 
     if not settings:
         log.error('Не удалось прочитать настройки — проверьте лист «Настройки»')
@@ -1548,15 +1734,15 @@ async def main():
         f'мин.длина: {state["min_length"]} | '
         f'правил: {len(rules)} | минус-слов: {len(minus)} | '
         f'канал частных: {state["dest_chat_id"]} | '
-        f'канал агентов: {state["dest_chat_id_agent"] or "не задан"}'
+        f'канал агентов: {state["dest_chat_id_agent"] or "не задан"} | '
+        f'таймаут ask_author: {ASK_AUTHOR_TIMEOUT_SEC}s'
     )
 
     if GEMINI_API_KEY:
         log.info('Gemini AI: ключ задан, AI-модерация активна (4 класса)')
     else:
-        log.warning('Gemini AI: GEMINI_API_KEY не задан — все посты идут в ручную модерацию')
+        log.warning('Gemini AI: GEMINI_API_KEY не задан — fallback: approve_private')
 
-    # ── Сбрасываем webhook ─────────────────────────────────────────────────
     if state['tg_token']:
         await loop.run_in_executor(
             _executor, _tg_request,
@@ -1636,7 +1822,6 @@ async def main():
                 log.info(f'[{_acc}][альбом] abs_id={abs_id} не в списке каналов — пропуск')
                 return
 
-            # Берём текст из первого сообщения альбома с непустым текстом
             text = ''
             text_entities = None
             for m in msgs:
@@ -1668,14 +1853,15 @@ async def main():
             except Exception:
                 chat = None
 
-            link        = _build_link(chat, first.id) if chat else f'https://t.me/c/{abs_id}/{first.id}'
-            author_name, author_link = _get_author_info(first)
+            link = _build_link(chat, first.id) if chat else f'https://t.me/c/{abs_id}/{first.id}'
+            author_name, author_link, user_id = _get_author_info(first)
 
             post = {
                 'date':         first.date.replace(tzinfo=None),
                 'chat_name':    chat_name,
                 'author_name':  author_name,
                 'author_link':  author_link,
+                'user_id':      user_id,
                 'link':         link,
                 'text':         text,
                 'html_text':    html_text,
@@ -1704,6 +1890,15 @@ async def main():
                 if isinstance(msg, (MessageService, MessageEmpty)):
                     return
                 if getattr(msg, 'action', None) is not None:
+                    return
+
+                # ── Входящее личное сообщение — ответ автора на наш вопрос ──
+                # event.is_private: True для личных чатов
+                # msg.out: False для входящих (не наших)
+                if event.is_private and not msg.out:
+                    sender_id = event.sender_id
+                    if sender_id and sender_id in pending_ask_author:
+                        await _handle_author_reply(msg.text or '', sender_id)
                     return
 
                 raw_id = event.chat_id
@@ -1764,26 +1959,27 @@ async def main():
                     log.info(f'[{_acc}][скор:{score}<{mod_threshold}] {chat_name} | {repr(text[:60])}')
                     return
 
-                chat        = await event.get_chat()
-                link        = _build_link(chat, msg.id)
-                author_name, author_link = _get_author_info(msg)
+                chat = await event.get_chat()
+                link = _build_link(chat, msg.id)
+                author_name, author_link, user_id = _get_author_info(msg)
 
                 log.info(f'[{_acc}][принят скор:{score}] {chat_name} → {link}')
 
                 post = {
-                    'date':        msg.date.replace(tzinfo=None),
-                    'chat_name':   chat_name,
-                    'author_name': author_name,
-                    'author_link': author_link,
-                    'link':        link,
-                    'text':        text,
-                    'html_text':   html_text,
-                    'score':       score,
-                    'account':     _acc,
-                    'src_chat_id': raw_id,
-                    'src_msg_id':  msg.id,
+                    'date':         msg.date.replace(tzinfo=None),
+                    'chat_name':    chat_name,
+                    'author_name':  author_name,
+                    'author_link':  author_link,
+                    'user_id':      user_id,
+                    'link':         link,
+                    'text':         text,
+                    'html_text':    html_text,
+                    'score':        score,
+                    'account':      _acc,
+                    'src_chat_id':  raw_id,
+                    'src_msg_id':   msg.id,
                     'grouped_refs': [(msg.chat_id, msg.id)],
-                    'added_at':    time.time(),
+                    'added_at':     time.time(),
                 }
 
                 metrics['processed'] += 1
@@ -1795,9 +1991,8 @@ async def main():
 
         log.info(f'[{acc_label}] Хендлер зарегистрирован')
 
-    # ── Запись в лог таблицы ───────────────────────────────────────────────
     await _safe_sheets(_write_log, ss, 'INFO',
-        f'Запущен | аккаунтов: {len(clients)} | '
+        f'Запущен v4 | аккаунтов: {len(clients)} | '
         f'каналов: {len(state["username_to_meta"])} | '
         f'правил: {len(state["scoring_rules"])} | '
         f'порог: {state["score_threshold"]} | '
@@ -1806,7 +2001,6 @@ async def main():
         f'канал агентов: {state["dest_chat_id_agent"] or "не задан"}'
     )
 
-    # ── Фоновые задачи ─────────────────────────────────────────────────────
     asyncio.create_task(_settings_reload_loop(clients, ss))
     asyncio.create_task(_bot_polling_loop(clients, ss))
     asyncio.create_task(_cleanup_pending_loop())
@@ -1815,7 +2009,8 @@ async def main():
     log.info(
         f'Слушаю события. '
         f'Настройки обновляются каждые {SETTINGS_RELOAD_SEC}с. '
-        f'Bot polling запущен.'
+        f'Bot polling запущен. '
+        f'ask_author таймаут: {ASK_AUTHOR_TIMEOUT_SEC}s.'
     )
 
     await asyncio.gather(*[c.run_until_disconnected() for c in clients.values()])
