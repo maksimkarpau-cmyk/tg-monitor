@@ -580,14 +580,28 @@ def _post_fingerprint(text: str, author_name: str) -> str:
 
 def _load_published_fingerprints(ss) -> set:
     try:
-        data = ss.worksheet('Посты').get_all_values()
+        from datetime import date, timedelta
+        today     = date.today()
+        yesterday = today - timedelta(days=1)  # если надо добавить позавчера - изменить 1 на 2
+        cutoff    = yesterday.strftime('%Y-%m-%d')   # 'YYYY-MM-DD' — достаточно префикса
+
+        data   = ss.worksheet('Посты').get_all_values()
         result = set()
+        skipped = 0
         for row in data[1:]:
+            ts          = row[0].strip() if row else ''
             text        = row[5].strip() if len(row) > 5 else ''
             author_name = row[2].strip() if len(row) > 2 else ''
+            # Дата хранится как 'YYYY-MM-DD HH:MM:SS' — берём первые 10 символов
+            if ts[:10] < cutoff:
+                skipped += 1
+                continue
             if text:
                 result.add(_post_fingerprint(text, author_name))
-        log.info(f'Загружено {len(result)} fingerprint-ов из листа «Посты»')
+        log.info(
+            f'Загружено {len(result)} fingerprint-ов из листа «Посты» '
+            f'(пропущено старых: {skipped})'
+        )
         return result
     except Exception as e:
         log.error(f'Ошибка загрузки fingerprints (Посты): {e}', exc_info=True)
