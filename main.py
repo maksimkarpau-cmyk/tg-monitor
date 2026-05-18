@@ -80,6 +80,7 @@ state = {
     'watched_ids':          set(),
     'id_to_meta':           {},
     'username_to_meta':     {},
+    'excluded_accounts':    set(),
 }
 
 TZ_OFFSET_HOURS = 3
@@ -186,11 +187,19 @@ def _read_settings(ss):
             'moderator_chat_id':    val(5),
             'dest_chat_id':         val(6),
             'dest_chat_id_agent':   val(7),
+            'excluded_accounts':    val(8),
         }
     except Exception as e:
         log.error('Ошибка чтения настроек: ' + str(e), exc_info=True)
         return None
 
+def _parse_excluded_accounts(raw: str) -> set:
+    result = set()
+    for part in raw.split(','):
+        part = part.strip()
+        if part.isdigit():
+            result.add(int(part))
+    return result
 
 def _read_scoring_rules(ss):
     try:
@@ -1449,6 +1458,7 @@ async def _settings_reload_loop(clients: dict, ss):
                         'moderator_chat_id':    new_settings['moderator_chat_id'],
                         'dest_chat_id':         new_settings['dest_chat_id'],
                         'dest_chat_id_agent':   new_settings.get('dest_chat_id_agent', ''),
+                        'excluded_accounts':    _parse_excluded_accounts(new_settings.get('excluded_accounts', '')),
                     })
             if new_rules  is not None:
                 async with _state_lock: state['scoring_rules'] = new_rules
@@ -1726,6 +1736,7 @@ async def main():
         'dest_chat_id_agent':   settings.get('dest_chat_id_agent', ''),
         'scoring_rules':        rules,
         'minus_words':          minus,
+        'excluded_accounts':    _parse_excluded_accounts(settings.get('excluded_accounts', '')),
     })
     log.info(
         f'Настройки загружены | '
@@ -1855,6 +1866,11 @@ async def main():
 
             link = _build_link(chat, first.id) if chat else f'https://t.me/c/{abs_id}/{first.id}'
             author_name, author_link, user_id = _get_author_info(first)
+            async with _state_lock:
+                excluded = set(state.get('excluded_accounts', set()))
+            if user_id and user_id in excluded:
+                log.info(f'[{_acc}][альбом исключён] user_id={user_id} {chat_name}')
+                return
 
             post = {
                 'date':         first.date.replace(tzinfo=None),
@@ -1962,6 +1978,11 @@ async def main():
                 chat = await event.get_chat()
                 link = _build_link(chat, msg.id)
                 author_name, author_link, user_id = _get_author_info(msg)
+                async with _state_lock:
+                    excluded = set(state.get('excluded_accounts', set()))
+                if user_id and user_id in excluded:
+                    log.info(f'[{_acc}][исключён] user_id={user_id} {chat_name}')
+                    return
 
                 log.info(f'[{_acc}][принят скор:{score}] {chat_name} → {link}')
 
