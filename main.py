@@ -991,11 +991,6 @@ def _build_prompt(text: str, score: int, sender_bio: str, is_reply: bool = False
 
 
 async def _ai_moderate(text: str, score: int, sender_bio: str = '', is_reply: bool = False) -> str:
-    """
-    Классифицирует текст через Gemini.
-    Возвращает: approve_private | approve_agent | ask_author | skip
-    При ошибке возвращает approve_private (безопасный fallback).
-    """
     if not GEMINI_API_KEY:
         log.warning('[gemini] GEMINI_API_KEY не задан — fallback: approve_private')
         return 'approve_private'
@@ -1046,14 +1041,31 @@ async def _ai_moderate(text: str, score: int, sender_bio: str = '', is_reply: bo
                 body = e.read().decode('utf-8')
             except Exception:
                 pass
-            log.warning(f'[gemini] HTTP {e.code}: {body[:200]} — fallback: approve_private')
-            return 'approve_private'
+            if e.code == 503:
+                raise RuntimeError('GEMINI_503')
+            log.warning(f'[gemini] HTTP {e.code}: {body[:200]} — fallback: moderation')
+            return 'MODERATION_NEEDED'
         except Exception as e:
-            log.warning(f'[gemini] ошибка: {e} — fallback: approve_private')
-            return 'approve_private'
+            log.warning(f'[gemini] ошибка: {e} — fallback: moderation')
+            return 'MODERATION_NEEDED'
 
-    return await loop.run_in_executor(_executor, _call_gemini)
+    for attempt in range(3):
+        try:
+            result = await loop.run_in_executor(_executor, _call_gemini)
+            return result
+        except RuntimeError as e:
+            if 'GEMINI_503' in str(e):
+                wait = (attempt + 1) * 10  # 10s, 20s, 30s
+                log.warning(
+                    f'[gemini] 503 — asyncio.sleep {wait}s '
+                    f'(попытка {attempt + 1}/3)'
+                )
+                await asyncio.sleep(wait)
+            else:
+                raise
 
+    log.warning('[gemini] все попытки исчерпаны → модерация')
+    return 'MODERATION_NEEDED'
 
 def _pick_dest_chat(ai_decision: str) -> str:
     if ai_decision == 'approve_agent' and state.get('dest_chat_id_agent'):
@@ -1566,16 +1578,6 @@ async def _process_and_publish(
     ss,
     acc: str,
 ):
-    """
-    Единая точка AI-модерации и публикации.
-
-    Порядок:
-      1. Дедупликация по published_fingerprints (лист «Посты»)
-      2. Дедупликация по ai_rejected_fingerprints (лист «Отклонено ИИ»)
-      3. Получение bio автора
-      4. AI-модерация → approve_private / approve_agent / ask_author / skip
-      5. Маршрутизация по решению
-    """
     text        = post['text']
     author_name = post['author_name']
     chat_name   = post['chat_name']
@@ -1590,7 +1592,6 @@ async def _process_and_publish(
         return
 
     # ── 2. Дедупликация: уже отклонён AI ──────────────────────────────────
-    # Используем fingerprint без автора — тот же текст из другой группы
     fp_anon = _post_fingerprint(text, '')
     if fp_anon in ai_rejected_fingerprints:
         log.info(f'[{acc}][дубль AI-rejected ⛔] {chat_name}')
@@ -1618,7 +1619,7 @@ async def _process_and_publish(
             log.info(f'[{acc}][риэлтор из списка] user_id={user_id} '
                      f'{ai_decision} → approve_agent')
         ai_decision = 'approve_agent'
-      
+
     log.info(f'[{acc}][AI:{ai_decision} скор:{score}] {chat_name} → {link}')
 
     post['ai_decision'] = ai_decision
@@ -1626,7 +1627,6 @@ async def _process_and_publish(
     # ── 5. Маршрутизация ───────────────────────────────────────────────────
 
     if ai_decision == 'skip':
-        # Запоминаем fingerprint чтобы не обрабатывать дубли этого поста
         ai_rejected_fingerprints.append(fp_anon)
         await _safe_sheets_retry(_write_ai_rejected, ss, post, ai_decision)
         return
@@ -1636,27 +1636,22 @@ async def _process_and_publish(
         return
 
     if ai_decision == 'ask_author':
-        # Нет user_id — некому писать, публикуем как approve_private
         if not user_id:
             log.info(f'[{acc}][ask_author] user_id неизвестен → approve_private')
             await _do_publish(post, client, ss, acc, 'approve_private')
             return
 
-        # Уже ожидаем ответа от этого пользователя — не дублируем вопрос
         if user_id in pending_ask_author:
             log.info(f'[{acc}][ask_author] user_id={user_id} уже в ожидании → пропуск')
             return
 
-        # Отправляем вопрос в личку
         sent = await _send_ask_author_message(client, user_id, link)
 
         if not sent:
-            # Личка закрыта — публикуем как approve_private
             log.info(f'[{acc}][ask_author] личка закрыта user_id={user_id} → approve_private')
             await _do_publish(post, client, ss, acc, 'approve_private')
             return
 
-        # Регистрируем ожидание с таймером
         timeout_handle = asyncio.get_event_loop().call_later(
             ASK_AUTHOR_TIMEOUT_SEC,
             lambda uid=user_id: asyncio.ensure_future(_ask_author_timeout(uid)),
@@ -1676,6 +1671,32 @@ async def _process_and_publish(
             f'ожидаем {ASK_AUTHOR_TIMEOUT_SEC}s | {link}'
         )
         await _safe_sheets_retry(_write_ask_author, ss, post, user_id)
+        return
+
+    if ai_decision == 'MODERATION_NEEDED':
+        async with _state_lock:
+            token     = state['tg_token']
+            moderator = state['moderator_chat_id']
+        if token and moderator:
+            pend_key = f'{post["src_chat_id"]}:{post["src_msg_id"]}'
+            post['added_at'] = time.time()
+            pending_moderation[pend_key] = post
+            loop = asyncio.get_event_loop()
+            bot_message_id = await loop.run_in_executor(
+                _executor, _send_moderation_card, post, token, moderator
+            )
+            post['bot_message_id'] = bot_message_id
+            await _safe_sheets_retry(_write_rejected, ss, post, bot_message_id)
+            metrics['moderated'] += 1
+            log.info(
+                f'[{acc}][gemini недоступен → модерация] '
+                f'{post["chat_name"]} → {post["link"]}'
+            )
+        else:
+            log.warning(
+                f'[{acc}][gemini недоступен, модератор не задан → skip] '
+                f'{post["link"]}'
+            )
         return
 
     # Неизвестный ответ AI — approve_private
