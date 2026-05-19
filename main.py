@@ -473,6 +473,37 @@ def _write_ask_author(ss, post: dict, user_id: int):
     except Exception as e:
         log.error(f'Ошибка записи в Ожидание: {e}', exc_info=True)
 
+def _add_realtor_to_sheet(ss, post: dict, user_id: int):
+    """Добавляет риэлтора в лист «Риэлторы» если его там ещё нет."""
+    try:
+        try:
+            ws = ss.worksheet('Риэлторы')
+        except Exception:
+            ws = ss.add_worksheet('Риэлторы', 1000, 4)
+            ws.append_row(['user_id', 'имя', 'комментарий', 'username'])
+
+        # Проверяем — вдруг уже есть
+        existing = [r[0].strip() for r in ws.get_all_values()[1:] if r]
+        if str(user_id) in existing:
+            return
+
+        # Извлекаем @username из ссылки https://t.me/username
+        author_link = post.get('author_link', '')
+        username = ''
+        if author_link:
+            m = re.search(r't\.me/([a-zA-Z0-9_]+)', author_link)
+            if m:
+                username = '@' + m.group(1)
+
+        ws.append_row([
+            str(user_id),
+            post.get('author_name', ''),
+            f'авто: ответил на ask_author {_local_now().strftime("%Y-%m-%d %H:%M")}',
+            username,
+        ], value_input_option='USER_ENTERED')
+        log.info(f'[риэлторы] user_id={user_id} ({username}) записан в лист')
+    except Exception as e:
+        log.error(f'Ошибка записи риэлтора: {e}', exc_info=True)
 
 def _update_ask_author_status(ss, user_id: int, status: str, ai_decision: str = ''):
     """Обновляет статус строки в листе «Ожидание» по user_id (первая строка со статусом 'ожидает')."""
@@ -861,6 +892,8 @@ def _build_prompt(text: str, score: int, sender_bio: str, is_reply: bool = False
 - «риелтор», «агент», «для клиента», «клиенту», «под клиента»
 - «работаю в недвижимости», «агентство», «broker»
 - «ищу для своего клиента», «подбираю для клиента»
+- «помощник агента», «ассистент риелтора», «работаю с агентом»
+- «ищу для клиента», «для клиента», «клиенту»
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ВАЖНЫЕ ПРАВИЛА:
@@ -898,8 +931,9 @@ def _build_prompt(text: str, score: int, sender_bio: str, is_reply: bool = False
 
 Риелтор или агент — есть хотя бы один профессиональный маркер:
 
-• Явный поиск для клиента: «для клиента», «клиенту», «под клиента», «сниму клиенту»
-
+• Явный поиск для клиента: «для клиента», «клиенту», «под клиента», «сниму клиенту»,
+  «ищу для клиента», «помощник агента», «ассистент риелтора», «работаю с агентом»
+  
 • Профессиональная идентификация: «риелтор», «агент», «broker», «estate», «realty»,
   «управляющая компания», «агентство»
 
@@ -1076,6 +1110,16 @@ async def _ask_author_timeout(user_id: int):
     await _safe_sheets(_update_ask_author_status, ss, user_id, 'таймаут', 'approve_private')
     await _do_publish(post, client, ss, acc, 'approve_private')
 
+    async def _delayed_delete():
+        await asyncio.sleep(30)
+        try:
+            await client.delete_dialog(user_id)
+            log.info(f'[ask_author] диалог с user_id={user_id} удалён (таймаут)')
+        except Exception as e:
+            log.warning(f'[ask_author] не удалось удалить диалог user_id={user_id}: {e}')
+
+    asyncio.ensure_future(_delayed_delete())
+
 
 async def _send_ask_author_message(client: TelegramClient, user_id: int, post_link: str) -> bool:
     """
@@ -1139,9 +1183,24 @@ async def _handle_author_reply(reply_text: str, user_id: int):
         ai_decision = 'approve_private'
 
     log.info(f'[ask_author AI:{ai_decision}] user_id={user_id} → {post["link"]}')
+    if ai_decision == 'approve_agent':
+        await _safe_sheets_retry(_add_realtor_to_sheet, ss, post, user_id)
+        async with _state_lock:
+            state['realtors'].add(user_id)
+        log.info(f'[ask_author] user_id={user_id} добавлен в риэлторы')
+      
     await _safe_sheets(_update_ask_author_status, ss, user_id, 'ответил', ai_decision)
     await _do_publish(post, client, ss, acc, ai_decision)
 
+    async def _delayed_delete():
+        await asyncio.sleep(30)
+        try:
+            await client.delete_dialog(user_id)
+            log.info(f'[ask_author] диалог с user_id={user_id} удалён (после ответа)')
+        except Exception as e:
+            log.warning(f'[ask_author] не удалось удалить диалог user_id={user_id}: {e}')
+
+    asyncio.ensure_future(_delayed_delete())
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Telegram Bot API
