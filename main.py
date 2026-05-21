@@ -55,6 +55,7 @@ GEMINI_API_KEY         = os.environ.get('GEMINI_API_KEY', '')
 
 # Таймаут ожидания ответа от автора (секунды)
 ASK_AUTHOR_TIMEOUT_SEC = int(os.environ.get('ASK_AUTHOR_TIMEOUT_SEC', '900'))  # 15 минут
+ASK_AUTHOR_ACCOUNT = os.environ.get('ASK_AUTHOR_ACCOUNT', 'acc2')
 
 # ── Логирование ────────────────────────────────────────────────────────────────
 
@@ -1574,6 +1575,7 @@ async def _update_watched_chats(clients: dict, channels: list, ss):
 async def _process_and_publish(
     post: dict,
     client: TelegramClient,
+    ask_client: TelegramClient,
     msgs_for_photos: list,
     ss,
     acc: str,
@@ -1645,7 +1647,7 @@ async def _process_and_publish(
             log.info(f'[{acc}][ask_author] user_id={user_id} уже в ожидании → пропуск')
             return
 
-        sent = await _send_ask_author_message(client, user_id, link)
+        sent = await _send_ask_author_message(ask_client, user_id, link)
 
         if not sent:
             log.info(f'[{acc}][ask_author] личка закрыта user_id={user_id} → approve_private')
@@ -1658,7 +1660,7 @@ async def _process_and_publish(
         )
         pending_ask_author[user_id] = {
             'post':           post,
-            'client':         client,
+            'client':         ask_client,
             'ss':             ss,
             'acc':            acc,
             'sender_bio':     sender_bio,
@@ -2060,6 +2062,11 @@ async def main():
     if not clients:
         log.error('Ни один аккаунт не подключён — выход')
         return
+    # ── Выбор аккаунта для ask_author ─────────────────────────────────────
+    ask_client = clients.get(ASK_AUTHOR_ACCOUNT) or next(iter(clients.values()))
+    ask_acc_label = ASK_AUTHOR_ACCOUNT if ASK_AUTHOR_ACCOUNT in clients else next(iter(clients.keys()))
+    log.info(f'ask_author аккаунт: {ask_acc_label}')
+  
     # ── Резолв риэлторов (требует готовых clients) ─────────────────────────
     realtors = await _resolve_realtors(ss, clients, resolved_r, to_resolve_r)
     state['realtors'] = realtors
@@ -2086,7 +2093,7 @@ async def main():
 
     album_buffer: dict = {}
 
-    async def _flush_album(grouped_id: int, _acc: str, _client: TelegramClient):
+    async def _flush_album(grouped_id: int, _acc: str, _client: TelegramClient, _ask_client: TelegramClient):
         entry = album_buffer.pop(grouped_id, None)
         if not entry:
             return
@@ -2170,8 +2177,8 @@ async def main():
             }
 
             metrics['processed'] += 1
-            await _process_and_publish(post, _client, msgs, ss, _acc)
-
+            await _process_and_publish(post, _client, _ask_client, msgs, ss, _acc)
+          
         except Exception as e:
             metrics['errors'] += 1
             log.error(f'_flush_album error grouped_id={grouped_id}: {e}', exc_info=True)
@@ -2186,15 +2193,6 @@ async def main():
                 if isinstance(msg, (MessageService, MessageEmpty)):
                     return
                 if getattr(msg, 'action', None) is not None:
-                    return
-
-                # ── Входящее личное сообщение — ответ автора на наш вопрос ──
-                # event.is_private: True для личных чатов
-                # msg.out: False для входящих (не наших)
-                if event.is_private and not msg.out:
-                    sender_id = event.sender_id
-                    if sender_id and sender_id in pending_ask_author:
-                        await _handle_author_reply(msg.text or '', sender_id)
                     return
 
                 raw_id = event.chat_id
@@ -2224,7 +2222,7 @@ async def main():
                     if grouped_id not in album_buffer:
                         handle = asyncio.get_event_loop().call_later(
                             1.5, lambda gid=grouped_id: asyncio.ensure_future(
-                                _flush_album(gid, _acc, _client)
+                                _flush_album(gid, _acc, _client, ask_client)
                             )
                         )
                         album_buffer[grouped_id] = {
@@ -2284,13 +2282,28 @@ async def main():
                 }
 
                 metrics['processed'] += 1
-                await _process_and_publish(post, _client, [msg], ss, _acc)
+                await _process_and_publish(post, _client, ask_client, [msg], ss, _acc)
 
             except Exception as e:
                 metrics['errors'] += 1
                 log.error(f'[{_acc}] Ошибка обработки сообщения: {e}', exc_info=True)
 
         log.info(f'[{acc_label}] Хендлер зарегистрирован')
+      
+    # ── Хендлер личных сообщений только на ask_client ─────────────────────
+    @ask_client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
+    async def _on_private_reply(event):
+        try:
+            msg = event.message
+            if msg.out:
+                return
+            sender_id = event.sender_id
+            if sender_id and sender_id in pending_ask_author:
+                await _handle_author_reply(msg.text or '', sender_id)
+        except Exception as e:
+            log.error(f'[ask_author reply] Ошибка: {e}', exc_info=True)
+    
+    log.info(f'[{ask_acc_label}] Хендлер личных сообщений зарегистрирован')
 
     await _safe_sheets(_write_log, ss, 'INFO',
         f'Запущен v4 | аккаунтов: {len(clients)} | '
