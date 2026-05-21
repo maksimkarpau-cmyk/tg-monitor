@@ -1331,6 +1331,15 @@ def _build_caption(post: dict) -> str:
     link        = post['link']
     author_name = post.get('author_name', '').strip()
     author_link = post.get('author_link', '').strip()
+    ai_decision = post.get('ai_decision', '')
+
+    if ai_decision == 'approve_private':
+        label = '👤 Частный клиент'
+    elif ai_decision == 'approve_agent':
+        label = '🏢 Риэлтор'
+    else:
+        label = ''
+
     source_line = f'Источник: <a href="{link}">{chat_name}</a>'
     if author_name and author_link:
         author_line = f'Автор: <a href="{author_link}">{author_name}</a>'
@@ -1338,14 +1347,15 @@ def _build_caption(post: dict) -> str:
         author_line = f'Автор: {author_name}'
     else:
         author_line = ''
+
     text = post['text']
-    header = source_line + '\n' + author_line if author_line else source_line
+    header_parts = [p for p in [author_line, source_line, label] if p]
+    header = '\n'.join(header_parts)
     max_text = 4096 - len(header) - 3
     if len(text) > max_text:
         text = text[:max_text].rstrip() + '…'
-    if author_line:
-        return f'{author_line}\n{source_line}\n\n{text}'
-    return f'{source_line}\n\n{text}'
+
+    return f'{header}\n\n{text}'
 
 
 # ── Bot API helpers для отправки медиа ────────────────────────────────────────
